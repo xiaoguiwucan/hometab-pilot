@@ -6,9 +6,17 @@ HomeTab Pilot 是一个面向 NAS、Homelab 和个人服务器场景的自托管
 
 ![HomeTab Pilot HUD 主题总览](docs/images/overview-hud.png)
 
-| macOS 流体玻璃主题 | Docker 容器管理 |
+| macOS 流体玻璃主题 | 赛博朋克霓虹主题 |
 | --- | --- |
-| ![macOS 流体玻璃主题](docs/images/theme-liquid.png) | ![Docker 容器管理](docs/images/docker-management.png) |
+| ![macOS 流体玻璃主题](docs/images/theme-liquid.png) | ![赛博朋克霓虹主题](docs/images/theme-cyber.png) |
+
+| 黑客代码终端主题 | 16 比特动画主题 |
+| --- | --- |
+| ![黑客代码终端主题](docs/images/theme-hacker.png) | ![16 比特动画主题](docs/images/theme-pixel.png) |
+
+| Future White HUD 主题 | Docker 容器管理 |
+| --- | --- |
+| ![Future White HUD 主题](docs/images/theme-hud.png) | ![Docker 容器管理](docs/images/docker-management.png) |
 
 | 容器日志查看 | 书签分类与整理 |
 | --- | --- |
@@ -26,6 +34,20 @@ HomeTab Pilot 是一个面向 NAS、Homelab 和个人服务器场景的自托管
 - 备份恢复：页面内导出和导入配置，适合迁移或重装后恢复。
 - 自适应布局：适配桌面、宽屏、窄屏和移动视口，避免横向溢出。
 - Docker 部署：单容器运行，数据持久化到 `/data`，支持 amd64 / arm64。
+
+## 多主题说明
+
+HomeTab Pilot 内置 5 套完整主题，不只是替换主色，而是针对不同使用场景调整了背景质感、组件层级、卡片边框、状态标签、曲线视觉和整体氛围。
+
+| 主题 | 风格定位 | 适合场景 |
+| --- | --- | --- |
+| macOS 流体玻璃 | 半透明玻璃、柔和阴影、轻量明亮 | 日常浏览器首页、NAS 家庭入口 |
+| 赛博朋克霓虹 | 高对比霓虹、深色背景、强状态感 | 夜间使用、运维监控、沉浸式大屏 |
+| 黑客代码终端 | 终端网格、代码感、高信息密度 | 开发者工作台、服务器状态查看 |
+| 16 比特动画 | 像素边框、游戏化视觉、复古动效 | 个人玩具化首页、娱乐化 NAS 入口 |
+| Future White HUD | 白色 HUD、细网格、仪表盘质感 | 长时间监控、桌面宽屏、简洁运维台 |
+
+主题可以在顶部主题切换器中实时切换；当前选择会保存在浏览器本地，下次打开自动恢复。
 
 ## 功能总览
 
