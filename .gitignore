@@ -1,0 +1,15 @@
+node_modules
+dist
+.DS_Store
+.playwright-mcp
+.env
+.env.local
+backups
+findings.md
+progress.md
+task_plan.md
+*.png
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*

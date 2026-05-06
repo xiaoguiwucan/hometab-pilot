@@ -1,0 +1,31 @@
+{
+  "categories": ["常用", "NAS", "AI", "下载", "影音", "开发", "工具", "生活"],
+  "bookmarks": [
+    { "name": "PVE", "url": "https://192.168.31.100:8006", "category": "NAS", "icon": "P", "color": "blue", "status": "online", "logoUrl": "https://www.proxmox.com/favicon.ico" },
+    { "name": "飞牛OS", "url": "http://192.168.31.101:5666", "category": "NAS", "icon": "牛", "color": "green", "status": "online", "logoUrl": "https://www.fnnas.com/favicon.ico" },
+    { "name": "网盘", "url": "https://www.aliyundrive.com", "category": "NAS", "icon": "云", "color": "cyan", "status": "online", "logoUrl": "https://www.aliyundrive.com/favicon.ico" },
+    { "name": "qBittorrent", "url": "https://www.qbittorrent.org", "category": "下载", "icon": "Q", "color": "amber", "status": "online", "logoUrl": "https://www.qbittorrent.org/favicon.ico" },
+    { "name": "Emby", "url": "https://emby.media", "category": "影音", "icon": "E", "color": "ink", "status": "online", "logoUrl": "https://emby.media/favicon.ico" },
+    { "name": "青龙", "url": "https://github.com/whyour/qinglong", "category": "工具", "icon": "青", "color": "teal", "status": "online", "logoUrl": "https://github.githubassets.com/favicons/favicon.svg" },
+    { "name": "OpenWrt", "url": "https://openwrt.org", "category": "NAS", "icon": "路", "color": "sage", "status": "online", "logoUrl": "https://openwrt.org/favicon.ico" },
+    { "name": "GitHub", "url": "https://github.com", "category": "开发", "icon": "G", "color": "slate", "logoUrl": "https://github.githubassets.com/favicons/favicon.svg" },
+    { "name": "Linux.do", "url": "https://linux.do", "category": "开发", "icon": "L", "color": "orange", "logoUrl": "https://linux.do/favicon.ico" },
+    { "name": "Gmail", "url": "https://mail.google.com", "category": "常用", "icon": "M", "color": "red", "logoUrl": "https://ssl.gstatic.com/ui/v1/icons/mail/rfr/gmail.ico" },
+    { "name": "豆包", "url": "https://www.doubao.com", "category": "AI", "icon": "豆", "color": "rose", "logoUrl": "https://www.doubao.com/favicon.ico" },
+    { "name": "Jellyfin", "url": "https://jellyfin.org", "category": "影音", "icon": "J", "color": "violet", "status": "online", "logoUrl": "https://jellyfin.org/favicon.ico" },
+    { "name": "影视库", "url": "https://movie.douban.com", "category": "影音", "icon": "影", "color": "clay", "logoUrl": "https://movie.douban.com/favicon.ico" },
+    { "name": "下载站", "url": "https://www.qbittorrent.org/download", "category": "下载", "icon": "下", "color": "gold", "logoUrl": "https://www.qbittorrent.org/favicon.ico" },
+    { "name": "添加", "url": "#add", "category": "常用", "icon": "+", "color": "light" }
+  ],
+  "folders": ["NAS", "AI", "下载", "影音"],
+  "recent": ["飞牛OS", "PVE 控制台", "qBittorrent", "GitHub", "Docker 容器"],
+  "favorites": [
+    { "title": "少数派 - 高效工作，品质生活", "url": "https://sspai.com", "subtitle": "sspai.com", "icon": "π" },
+    { "title": "TG频道大全", "url": "https://t.me", "subtitle": "telegram.org", "icon": "↗" }
+  ],
+  "systems": {
+    "fnos": { "status": "已连接", "storage": 68, "cpu": 23, "memory": 54 },
+    "pve": { "status": "node-01 在线", "vms": 6, "chips": ["OpenWrt", "FNOS", "Ubuntu"] },
+    "containers": { "running": 12, "services": ["qb", "emby", "cloud", "qinglong"] }
+  }
+}
