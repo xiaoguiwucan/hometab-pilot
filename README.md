@@ -2,6 +2,18 @@
 
 HomeTab Pilot 是一个面向 NAS、Homelab 和个人服务器场景的自托管导航页。它不只是书签墙，还把飞牛 OS、PVE、Docker 容器状态、日志、资源占用和常用管理操作整合到同一个首页里，适合放在浏览器新标签页、NAS 首页、软路由首页或家庭服务器入口。
 
+## 效果预览
+
+![HomeTab Pilot HUD 主题总览](docs/images/overview-hud.png)
+
+| macOS 流体玻璃主题 | Docker 容器管理 |
+| --- | --- |
+| ![macOS 流体玻璃主题](docs/images/theme-liquid.png) | ![Docker 容器管理](docs/images/docker-management.png) |
+
+| 容器日志查看 | 书签分类与整理 |
+| --- | --- |
+| ![容器日志查看](docs/images/container-logs.png) | ![书签分类与整理](docs/images/bookmark-organize.png) |
+
 ## 项目特色
 
 - 真实设备面板：通过飞牛 OS SSH、PVE API 拉取实时状态，不是静态演示数据。
