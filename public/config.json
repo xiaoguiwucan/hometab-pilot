@@ -1,8 +1,8 @@
 {
   "categories": ["常用", "NAS", "AI", "下载", "影音", "开发", "工具", "生活"],
   "bookmarks": [
-    { "name": "PVE", "url": "https://192.168.31.100:8006", "category": "NAS", "icon": "P", "color": "blue", "status": "online", "logoUrl": "https://www.proxmox.com/favicon.ico" },
-    { "name": "飞牛OS", "url": "http://192.168.31.101:5666", "category": "NAS", "icon": "牛", "color": "green", "status": "online", "logoUrl": "https://www.fnnas.com/favicon.ico" },
+    { "name": "PVE", "url": "https://pve.example.local:8006", "category": "NAS", "icon": "P", "color": "blue", "status": "online", "logoUrl": "https://www.proxmox.com/favicon.ico" },
+    { "name": "飞牛OS", "url": "http://fnos.example.local:5666", "category": "NAS", "icon": "牛", "color": "green", "status": "online", "logoUrl": "https://www.fnnas.com/favicon.ico" },
     { "name": "网盘", "url": "https://www.aliyundrive.com", "category": "NAS", "icon": "云", "color": "cyan", "status": "online", "logoUrl": "https://www.aliyundrive.com/favicon.ico" },
     { "name": "qBittorrent", "url": "https://www.qbittorrent.org", "category": "下载", "icon": "Q", "color": "amber", "status": "online", "logoUrl": "https://www.qbittorrent.org/favicon.ico" },
     { "name": "Emby", "url": "https://emby.media", "category": "影音", "icon": "E", "color": "ink", "status": "online", "logoUrl": "https://emby.media/favicon.ico" },

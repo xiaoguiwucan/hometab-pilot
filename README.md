@@ -2,8 +2,8 @@
 
 HomeTab Pilot 是一个面向 NAS、Homelab 和个人服务器场景的自托管导航页。它不只是书签墙，还把飞牛 OS、PVE、Docker 容器状态、日志、资源占用和常用管理操作整合到同一个首页里，适合放在浏览器新标签页、NAS 首页、软路由首页或家庭服务器入口。
 
-当前版本：`v0.2.0`  
-更新记录：[CHANGELOG.md](CHANGELOG.md) · GitHub Releases：[v0.2.0](https://github.com/xiaoguiwucan/hometab-pilot/releases/tag/v0.2.0)
+当前版本：`v0.3.0`
+更新记录：[CHANGELOG.md](CHANGELOG.md) · GitHub Releases：[v0.3.0](https://github.com/xiaoguiwucan/hometab-pilot/releases/tag/v0.3.0)
 
 ## 效果预览
 
@@ -28,6 +28,10 @@ HomeTab Pilot 是一个面向 NAS、Homelab 和个人服务器场景的自托管
 ## 项目特色
 
 - 版本化发布：GitHub Releases 和 Docker Hub 镜像标签按版本区分，支持 `latest` 与固定版本回滚。
+- 登录鉴权：首次配置向导设置管理密码，Docker/PVE 危险操作需要解锁。
+- 通知告警：支持 Bark、Telegram、企业微信机器人、Server 酱和通用 Webhook，并提供页面化配置和测试发送。
+- 容器更新中心：支持检查、拉取镜像、重建容器，并在操作前保存配置备份。
+- 审计导出：服务端记录 Docker/PVE/Auth/通知操作，可导出 JSON 审计日志。
 - 真实设备面板：通过飞牛 OS SSH、PVE API 拉取实时状态，不是静态演示数据。
 - Docker 容器管理：展示容器运行状态、CPU、内存、网络、端口访问地址、日志和配置，并支持重启、停止等操作。
 - Web 容器同步：一键发现飞牛 OS Docker 中可访问的 Web 容器，并同步到 `NAS` 书签分组。
@@ -117,7 +121,7 @@ docker run -d \
   -p 8088:8080 \
   -v hometab-data:/data \
   --env-file .env \
-  xiaoguiwucan0426/hometab-pilot:0.2.0
+  xiaoguiwucan0426/hometab-pilot:0.3.0
 ```
 
 访问：
@@ -164,6 +168,13 @@ cp .env.example .env
 | `PVE_TOKEN_ID` | PVE API Token ID | `root@pam!hometab` |
 | `PVE_TOKEN_SECRET` | PVE API Token Secret | 留在 `.env` 中 |
 | `PVE_TLS_VERIFY` | 是否校验证书 | `false` |
+| `NOTIFY_ENABLED` | 是否启用主动推送 | `true` |
+| `BARK_URL` | Bark 推送地址 | `https://api.day.app/xxxx` |
+| `SERVER_CHAN_KEY` | Server 酱 SendKey | `SCTxxxx` |
+| `TELEGRAM_BOT_TOKEN` | Telegram Bot Token | 留在 `.env` 中 |
+| `TELEGRAM_CHAT_ID` | Telegram Chat ID | `-100xxxx` |
+| `WECOM_WEBHOOK_URL` | 企业微信机器人 Webhook | 留在 `.env` 中 |
+| `NOTIFY_WEBHOOK_URL` | 通用 Webhook | `https://example.com/hook` |
 
 PVE 可以二选一：
 
@@ -171,6 +182,8 @@ PVE 可以二选一：
 - 使用 `PVE_TOKEN_ID` + `PVE_TOKEN_SECRET`
 
 建议生产环境优先使用 PVE API Token，并给 Token 分配最小权限。
+
+通知通道也可以在页面 `设置 -> 通知告警` 中配置。已保存的密钥不会回显，输入框留空代表保留原值。
 
 ## Docker Compose 示例
 
@@ -211,7 +224,7 @@ FNOS_URL=http://你的飞牛OS地址:端口
 FNOS_SSH_HOST=你的飞牛OS地址
 FNOS_SSH_PORT=22
 FNOS_SSH_USERNAME=你的用户名
-FNOS_SSH_PASSWORD=你的密码
+FNOS_SSH_PASSWORD=
 ```
 
 4. 重启服务：
@@ -229,7 +242,7 @@ docker compose up -d
 ```bash
 PVE_URL=https://你的PVE地址:8006
 PVE_USERNAME=root@pam
-PVE_PASSWORD=你的密码
+PVE_PASSWORD=
 PVE_TLS_VERIFY=false
 ```
 
@@ -294,7 +307,7 @@ docker compose up -d
 推荐生产部署使用固定版本标签，方便回滚：
 
 ```bash
-docker pull xiaoguiwucan0426/hometab-pilot:0.2.0
+docker pull xiaoguiwucan0426/hometab-pilot:0.3.0
 docker pull xiaoguiwucan0426/hometab-pilot:latest
 ```
 

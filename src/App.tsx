@@ -59,6 +59,30 @@ type BackupSummary = {
   size?: number;
 };
 
+type AuthStatus = {
+  configured: boolean;
+  required: boolean;
+  authenticated: boolean;
+};
+
+type NotificationPublicSettings = {
+  enabled: boolean;
+  barkConfigured: boolean;
+  serverChanConfigured: boolean;
+  telegramConfigured: boolean;
+  webhookConfigured: boolean;
+  wecomConfigured: boolean;
+};
+
+type NotificationSettingsDraft = NotificationPublicSettings & {
+  barkUrl: string;
+  serverChanKey: string;
+  telegramBotToken: string;
+  telegramChatId: string;
+  webhookUrl: string;
+  wecomWebhookUrl: string;
+};
+
 type RuntimeStatus = {
   fnos?: {
     available: boolean;
@@ -257,6 +281,7 @@ const localBookmarkKey = "hometab.customBookmarks.v1";
 const localConfigKey = "hometab.configDraft.v1";
 const localEventsKey = "hometab.runtimeEvents.v1";
 const localAlertRulesKey = "hometab.alertRules.v1";
+const authTokenKey = "hometab.authToken.v1";
 const focusableSelector = [
   "a[href]",
   "button:not([disabled])",
@@ -357,6 +382,10 @@ function readLocalBookmarks() {
 
 function writeLocalBookmarks(bookmarks: Bookmark[]) {
   window.localStorage.setItem(localBookmarkKey, JSON.stringify(bookmarks));
+}
+
+function authHeaders(token: string) {
+  return token ? { Authorization: `Bearer ${token}` } : {};
 }
 
 function readRuntimeEvents() {
@@ -800,6 +829,16 @@ function useRuntime() {
           Math.abs(item.ts - event.ts) < 60_000
         )));
         if (!freshEvents.length) return current;
+        freshEvents
+          .filter((event) => event.severity === "critical" || event.severity === "warn")
+          .slice(0, 3)
+          .forEach((event) => {
+            void fetch("/api/notifications/event", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ title: event.title, message: event.detail, severity: event.severity })
+            }).catch(() => undefined);
+          });
         const merged = [...freshEvents, ...current].slice(0, 80);
         writeRuntimeEvents(merged);
         return merged;
@@ -1618,6 +1657,10 @@ function SystemCards({
   lastRefreshAt,
   onRefreshRuntime,
   onSyncWebBookmarks,
+  authToken,
+  authStatus,
+  onRequireAuth,
+  onAuthExpired,
   onClearEvents,
   onAuditEvent,
   onNotice
@@ -1630,6 +1673,10 @@ function SystemCards({
   lastRefreshAt: string;
   onRefreshRuntime: () => Promise<void>;
   onSyncWebBookmarks: () => Promise<SyncWebBookmarksPayload>;
+  authToken: string;
+  authStatus: AuthStatus;
+  onRequireAuth: () => boolean;
+  onAuthExpired: () => void;
   onClearEvents: () => void;
   onAuditEvent: (title: string, detail: string, severity?: EventSeverity) => void;
   onNotice: (message: string) => void;
@@ -1643,6 +1690,7 @@ function SystemCards({
   const [pendingPveAction, setPendingPveAction] = useState<{ action: PveAction; label: string; vm: PveVm } | null>(null);
   const [executingAction, setExecutingAction] = useState("");
   const [syncingWebBookmarks, setSyncingWebBookmarks] = useState(false);
+  const [updateMessage, setUpdateMessage] = useState("");
   const [pveActionMessage, setPveActionMessage] = useState("");
   const fnos = status.fnos || {
     available: true,
@@ -1697,6 +1745,7 @@ function SystemCards({
   }
 
   async function runPveAction(action: PveAction, label: string, vm: PveVm) {
+    if (!onRequireAuth()) return;
     const node = vm.node || status.pve?.node;
     const type = vm.type === "lxc" ? "lxc" : "qemu";
     if (!node || !vm.vmid) {
@@ -1708,7 +1757,8 @@ function SystemCards({
     onAuditEvent(`PVE ${label}已提交`, `${vm.name || vm.vmid} · ${type.toUpperCase()} ${vm.vmid}`);
     try {
       const response = await fetch(`/api/pve/${encodeURIComponent(node)}/${type}/${encodeURIComponent(vm.vmid)}/${action}`, {
-        method: "POST"
+        method: "POST",
+        headers: authHeaders(authToken)
       });
       const text = await response.text();
       if (response.ok) {
@@ -1718,6 +1768,7 @@ function SystemCards({
         onAuditEvent(`PVE ${label}成功`, `${vm.name || vm.vmid} · 指令已发送`);
         await onRefreshRuntime();
       } else {
+        if (response.status === 401) onAuthExpired();
         setPveActionMessage(`${label}失败：${text}`);
         onAuditEvent(`PVE ${label}失败`, `${vm.name || vm.vmid} · ${text}`, "warn");
       }
@@ -1740,6 +1791,7 @@ function SystemCards({
   }
 
   async function runContainerAction(action: "start" | "stop" | "restart", label: string, container = selectedContainer) {
+    if (!onRequireAuth()) return;
     if (!container?.id) {
       setActionMessage(`当前没有可${label}的真实容器。`);
       return;
@@ -1749,7 +1801,8 @@ function SystemCards({
     onAuditEvent(`Docker ${label}已提交`, `${container.name} · ${container.image || "unknown"}`);
     try {
       const response = await fetch(`/api/docker/containers/${encodeURIComponent(container.id)}/${action}`, {
-        method: "POST"
+        method: "POST",
+        headers: authHeaders(authToken)
       });
       const text = await response.text();
       if (response.ok) {
@@ -1759,6 +1812,7 @@ function SystemCards({
         onAuditEvent(`Docker ${label}成功`, `${container.name} · 指令已执行`);
         await onRefreshRuntime();
       } else {
+        if (response.status === 401) onAuthExpired();
         setActionMessage(`${label}失败：${text}`);
         onAuditEvent(`Docker ${label}失败`, `${container.name} · ${text}`, "warn");
       }
@@ -1789,6 +1843,46 @@ function SystemCards({
       setActionMessage(error instanceof Error ? error.message : "配置读取失败。");
     } finally {
       setConfigLoadingContainer(null);
+    }
+  }
+
+  async function runUpdateAction(action: "update" | "pull" | "recreate" | "rollback", container = selectedContainer) {
+    if (!container?.id) return;
+    if (action !== "update" && !onRequireAuth()) return;
+    const endpoints = {
+      update: `/api/docker/containers/${encodeURIComponent(container.id)}/update`,
+      pull: `/api/docker/containers/${encodeURIComponent(container.id)}/pull`,
+      recreate: `/api/docker/containers/${encodeURIComponent(container.id)}/recreate`,
+      rollback: "/api/docker/backups"
+    };
+    setExecutingAction(`update:${action}:${container.id}`);
+    try {
+      const response = await fetch(endpoints[action], {
+        method: action === "update" || action === "rollback" ? "GET" : "POST",
+        headers: authHeaders(authToken)
+      });
+      const text = await response.text();
+      if (!response.ok) {
+        if (response.status === 401) onAuthExpired();
+        throw new Error(text);
+      }
+      const payload = text ? JSON.parse(text) : {};
+      const message = action === "update"
+        ? `镜像 ${payload.image || container.image} 已检查，备份 ${payload.backups?.length || 0} 个。`
+        : action === "pull"
+          ? `已拉取 ${payload.image || container.image}。`
+          : action === "recreate"
+            ? `已重建 ${container.name}，备份 ${payload.backup || "已保存"}。`
+            : `已有 ${payload.backups?.length || 0} 个容器备份可回滚。`;
+      setUpdateMessage(message);
+      onNotice(message);
+      if (action !== "update" && action !== "rollback") await onRefreshRuntime();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "更新中心操作失败。";
+      setUpdateMessage(message);
+      onNotice(message);
+    } finally {
+      setExecutingAction("");
     }
   }
 
@@ -1935,6 +2029,11 @@ function SystemCards({
             onConfig={() => showContainerConfig(selectedContainer)}
             onToggle={() => requestContainerAction(selectedContainer.state === "running" ? "stop" : "start", selectedContainer.state === "running" ? "停止" : "启动", selectedContainer)}
             onRestart={() => requestContainerAction("restart", "重启", selectedContainer)}
+            onUpdateCheck={() => runUpdateAction("update", selectedContainer)}
+            onPullImage={() => runUpdateAction("pull", selectedContainer)}
+            onRecreate={() => runUpdateAction("recreate", selectedContainer)}
+            onRollbackList={() => runUpdateAction("rollback", selectedContainer)}
+            updateMessage={updateMessage}
           />
         ) : null}
         {pendingContainerAction ? (
@@ -2019,6 +2118,15 @@ function EventCenterDialog({ events, onClear, onClose }: { events: RuntimeEvent[
     }
     return groups;
   }, []);
+  async function exportAudit() {
+    const token = window.localStorage.getItem(authTokenKey) || "";
+    const response = await fetch("/api/audit/export", { headers: authHeaders(token) });
+    if (response.ok) {
+      downloadText(`hometab-audit-${new Date().toISOString().slice(0, 10)}.json`, await response.text());
+    } else {
+      downloadJson(`hometab-local-events-${new Date().toISOString().slice(0, 10)}.json`, events);
+    }
+  }
 
   return (
     <DialogShell className="utility-dialog utility-dialog--wide events-dialog" onClose={onClose}>
@@ -2031,6 +2139,9 @@ function EventCenterDialog({ events, onClear, onClose }: { events: RuntimeEvent[
         ))}
         <button className="events-clear" type="button" disabled={!events.length} onClick={onClear}>
           清空记录
+        </button>
+        <button className="events-clear" type="button" onClick={() => void exportAudit()}>
+          导出审计
         </button>
       </div>
       <div className="events-list">
@@ -2405,7 +2516,12 @@ function ContainerDetailPanel({
   onLogs,
   onConfig,
   onToggle,
-  onRestart
+  onRestart,
+  onUpdateCheck,
+  onPullImage,
+  onRecreate,
+  onRollbackList,
+  updateMessage
 }: {
   container: DockerService;
   actionMessage: string;
@@ -2415,6 +2531,11 @@ function ContainerDetailPanel({
   onConfig: () => void;
   onToggle: () => void;
   onRestart: () => void;
+  onUpdateCheck: () => void;
+  onPullImage: () => void;
+  onRecreate: () => void;
+  onRollbackList: () => void;
+  updateMessage: string;
 }) {
   const cpu = readPercent(container.cpu);
   const memory = readPercent(container.memory);
@@ -2466,6 +2587,16 @@ function ContainerDetailPanel({
           <button type="button" disabled={isBusy} onClick={onRestart}><UiIcon name="refresh" />重启</button>
           <button type="button" disabled={isBusy} onClick={onToggle}><UiIcon name={container.state === "running" ? "stop" : "open"} />{container.state === "running" ? "停止" : "启动"}</button>
         </div>
+      </div>
+      <div className="update-center">
+        <b>更新中心</b>
+        <div className="panel-actions panel-actions--containers">
+          <button type="button" disabled={isBusy} onClick={onUpdateCheck}><UiIcon name="search" />检查</button>
+          <button type="button" disabled={isBusy} onClick={onPullImage}><UiIcon name="download" />拉取</button>
+          <button type="button" disabled={isBusy} onClick={onRecreate}><UiIcon name="refresh" />重建</button>
+          <button type="button" disabled={isBusy} onClick={onRollbackList}><UiIcon name="cloud" />备份</button>
+        </div>
+        {updateMessage ? <small>{updateMessage}</small> : <small>拉取、重建前会自动保存容器配置备份。</small>}
       </div>
       {actionMessage ? <p className="action-message">{actionMessage}</p> : null}
     </div>
@@ -2830,11 +2961,15 @@ function SettingsDialog({
   alertRules,
   customCount,
   allBookmarks,
+  authToken,
+  authStatus,
   onSave,
   onOrganizeBookmarks,
   onSaveConnections,
   onSaveAlertRules,
   onRefreshRuntime,
+  onRequireAuth,
+  onAuthExpired,
   onResetBookmarks,
   onClose
 }: {
@@ -2844,17 +2979,35 @@ function SettingsDialog({
   alertRules: AlertRules;
   customCount: number;
   allBookmarks: Bookmark[];
+  authToken: string;
+  authStatus: AuthStatus;
   onSave: (config: AppConfig) => Promise<void>;
   onOrganizeBookmarks: (bookmarks: Bookmark[], categories: string[]) => Promise<void>;
   onSaveConnections: (connections: ConnectionSettings) => Promise<void>;
   onSaveAlertRules: (rules: AlertRules) => void;
   onRefreshRuntime: () => Promise<void>;
+  onRequireAuth: () => boolean;
+  onAuthExpired: () => void;
   onResetBookmarks: () => Promise<void>;
   onClose: () => void;
 }) {
   const [draft, setDraft] = useState("");
   const [connectionDraft, setConnectionDraft] = useState<ConnectionSettings>(connections);
   const [alertDraft, setAlertDraft] = useState<AlertRules>(alertRules);
+  const [notificationDraft, setNotificationDraft] = useState<NotificationSettingsDraft>({
+    enabled: false,
+    barkConfigured: false,
+    serverChanConfigured: false,
+    telegramConfigured: false,
+    webhookConfigured: false,
+    wecomConfigured: false,
+    barkUrl: "",
+    serverChanKey: "",
+    telegramBotToken: "",
+    telegramChatId: "",
+    webhookUrl: "",
+    wecomWebhookUrl: ""
+  });
   const [categoryDraft, setCategoryDraft] = useState<string[]>(config.categories);
   const [newCategory, setNewCategory] = useState("");
   const [message, setMessage] = useState("");
@@ -2872,6 +3025,40 @@ function SettingsDialog({
       setMessage("");
     }
   }, [alertRules, config, connections, open]);
+
+  useEffect(() => {
+    if (!open) return;
+    if (authStatus.required && !authStatus.authenticated) return;
+    let active = true;
+    fetch("/api/notifications", { headers: authHeaders(authToken) })
+      .then((response) => {
+        if (response.status === 401) {
+          onAuthExpired();
+          throw new Error("请先解锁后再配置通知。");
+        }
+        if (!response.ok) throw new Error("通知配置读取失败。");
+        return response.json() as Promise<NotificationPublicSettings>;
+      })
+      .then((settings) => {
+        if (!active) return;
+        setNotificationDraft((current) => ({
+          ...current,
+          ...settings,
+          barkUrl: "",
+          serverChanKey: "",
+          telegramBotToken: "",
+          telegramChatId: "",
+          webhookUrl: "",
+          wecomWebhookUrl: ""
+        }));
+      })
+      .catch((error) => {
+        if (active) setMessage(error instanceof Error ? error.message : "通知配置读取失败。");
+      });
+    return () => {
+      active = false;
+    };
+  }, [authStatus.authenticated, authStatus.required, authToken, onAuthExpired, open]);
 
   if (!open) return null;
 
@@ -2988,6 +3175,38 @@ function SettingsDialog({
     await refreshStatus();
   }
 
+  async function saveNotifications(testAfterSave = false) {
+    if (!onRequireAuth()) return;
+    try {
+      const response = await fetch("/api/notifications", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json", ...authHeaders(authToken) },
+        body: JSON.stringify(notificationDraft)
+      });
+      if (response.status === 401) {
+        onAuthExpired();
+        throw new Error("登录已过期，请重新解锁。");
+      }
+      if (!response.ok) throw new Error("通知配置保存失败。");
+      const settings = (await response.json()) as NotificationPublicSettings;
+      setNotificationDraft((current) => ({ ...current, ...settings, barkUrl: "", serverChanKey: "", telegramBotToken: "", telegramChatId: "", webhookUrl: "", wecomWebhookUrl: "" }));
+      if (testAfterSave) {
+        const testResponse = await fetch("/api/notifications/test", { method: "POST", headers: authHeaders(authToken) });
+        if (testResponse.status === 401) {
+          onAuthExpired();
+          throw new Error("登录已过期，请重新解锁。");
+        }
+        if (!testResponse.ok) throw new Error("测试通知发送失败。");
+        const result = await testResponse.json() as { ok?: boolean };
+        setMessage(result.ok ? "通知配置已保存，测试通知已发送。" : "通知配置已保存，但没有可用通道或通道未返回成功。");
+        return;
+      }
+      setMessage("通知配置已保存。");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "通知配置保存失败。");
+    }
+  }
+
   return (
     <DialogShell className="utility-dialog utility-dialog--wide" onClose={onClose}>
         <DialogHead title="设置" subtitle={`当前有 ${customCount} 个自定义书签。`} onClose={onClose} />
@@ -3054,6 +3273,91 @@ function SettingsDialog({
             刷新状态
           </button>
         </div>
+        <section className="notification-panel" aria-label="通知告警">
+          <div className="alert-rules-panel__head">
+            <b>通知告警</b>
+            <small>Bark、Telegram、企业微信、Server 酱或通用 Webhook；密钥留空不会覆盖现有配置。</small>
+          </div>
+          <label className="toggle-row">
+            <input
+              type="checkbox"
+              checked={notificationDraft.enabled}
+              onChange={(event) => setNotificationDraft((current) => ({ ...current, enabled: event.target.checked }))}
+            />
+            启用主动推送
+          </label>
+          <div className="notification-status-grid">
+            {[
+              ["Bark", notificationDraft.barkConfigured],
+              ["Telegram", notificationDraft.telegramConfigured],
+              ["企业微信", notificationDraft.wecomConfigured],
+              ["Server 酱", notificationDraft.serverChanConfigured],
+              ["Webhook", notificationDraft.webhookConfigured]
+            ].map(([name, configured]) => (
+              <span key={String(name)} className={configured ? "is-ready" : ""}>
+                {name} · {configured ? "已配置" : "未配置"}
+              </span>
+            ))}
+          </div>
+          <div className="connection-grid">
+            <label className="plain-label">
+              Bark URL
+              <input
+                placeholder={notificationDraft.barkConfigured ? "已配置，留空不修改" : "https://api.day.app/xxxx"}
+                value={notificationDraft.barkUrl}
+                onChange={(event) => setNotificationDraft((current) => ({ ...current, barkUrl: event.target.value }))}
+              />
+            </label>
+            <label className="plain-label">
+              Server 酱 SendKey
+              <input
+                placeholder={notificationDraft.serverChanConfigured ? "已配置，留空不修改" : "SCTxxxxxxxx"}
+                value={notificationDraft.serverChanKey}
+                onChange={(event) => setNotificationDraft((current) => ({ ...current, serverChanKey: event.target.value }))}
+              />
+            </label>
+            <label className="plain-label">
+              Telegram Bot Token
+              <input
+                placeholder={notificationDraft.telegramConfigured ? "已配置，留空不修改" : "123456:xxxx"}
+                value={notificationDraft.telegramBotToken}
+                onChange={(event) => setNotificationDraft((current) => ({ ...current, telegramBotToken: event.target.value }))}
+              />
+            </label>
+            <label className="plain-label">
+              Telegram Chat ID
+              <input
+                placeholder={notificationDraft.telegramConfigured ? "已配置，留空不修改" : "-100xxxxxxxx"}
+                value={notificationDraft.telegramChatId}
+                onChange={(event) => setNotificationDraft((current) => ({ ...current, telegramChatId: event.target.value }))}
+              />
+            </label>
+            <label className="plain-label connection-grid__wide">
+              企业微信机器人 Webhook
+              <input
+                placeholder={notificationDraft.wecomConfigured ? "已配置，留空不修改" : "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=..."}
+                value={notificationDraft.wecomWebhookUrl}
+                onChange={(event) => setNotificationDraft((current) => ({ ...current, wecomWebhookUrl: event.target.value }))}
+              />
+            </label>
+            <label className="plain-label connection-grid__wide">
+              通用 Webhook
+              <input
+                placeholder={notificationDraft.webhookConfigured ? "已配置，留空不修改" : "https://example.com/hook"}
+                value={notificationDraft.webhookUrl}
+                onChange={(event) => setNotificationDraft((current) => ({ ...current, webhookUrl: event.target.value }))}
+              />
+            </label>
+          </div>
+          <div className="dialog-actions">
+            <button type="button" onClick={() => void saveNotifications(false)}>
+              保存通知
+            </button>
+            <button type="button" onClick={() => void saveNotifications(true)}>
+              保存并测试
+            </button>
+          </div>
+        </section>
         <section className="category-manager" aria-label="分类管理">
           <div className="alert-rules-panel__head">
             <b>分类管理</b>
@@ -3375,6 +3679,62 @@ function ImportBookmarksDialog({
   );
 }
 
+function AuthDialog({ open, onLogin, onClose }: { open: boolean; onLogin: (password: string) => Promise<void>; onClose: () => void }) {
+  const [password, setPassword] = useState("");
+  const [message, setMessage] = useState("");
+  if (!open) return null;
+  async function submit() {
+    try {
+      await onLogin(password);
+      setPassword("");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "登录失败。");
+    }
+  }
+  return (
+    <DialogShell className="utility-dialog" onClose={onClose}>
+      <DialogHead title="管理解锁" subtitle="Docker/PVE 危险操作需要管理密码。" onClose={onClose} />
+      <label className="plain-label">管理密码</label>
+      <input className="text-input" type="password" value={password} onChange={(event) => setPassword(event.target.value)} onKeyDown={(event) => event.key === "Enter" ? void submit() : undefined} autoFocus />
+      {message ? <p className="dialog-message">{message}</p> : null}
+      <div className="dialog-actions">
+        <button type="button" onClick={onClose}>取消</button>
+        <button type="button" onClick={submit}>解锁</button>
+      </div>
+    </DialogShell>
+  );
+}
+
+function SetupWizard({ open, onSetup, onClose }: { open: boolean; onSetup: (password: string) => Promise<void>; onClose: () => void }) {
+  const [password, setPassword] = useState("");
+  const [message, setMessage] = useState("");
+  if (!open) return null;
+  async function submit() {
+    try {
+      await onSetup(password);
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "初始化失败。");
+    }
+  }
+  return (
+    <DialogShell className="utility-dialog" onClose={onClose}>
+      <DialogHead title="首次配置向导" subtitle="设置管理密码后，再配置 FNOS、PVE、通知和主题。" onClose={onClose} />
+      <div className="setup-steps">
+        <span>1 设置管理密码</span>
+        <span>2 设置 FNOS / PVE</span>
+        <span>3 同步 Web 容器书签</span>
+      </div>
+      <label className="plain-label">管理密码</label>
+      <input className="text-input" type="password" value={password} onChange={(event) => setPassword(event.target.value)} autoFocus />
+      {message ? <p className="dialog-message">{message}</p> : null}
+      <div className="dialog-actions">
+        <button type="button" onClick={onClose}>稍后</button>
+        <button type="button" onClick={submit}>完成初始化</button>
+      </div>
+    </DialogShell>
+  );
+}
+
 function ConfirmDialog({
   title,
   message,
@@ -3535,6 +3895,10 @@ export function App() {
   const [wallpaperOpen, setWallpaperOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [backupOpen, setBackupOpen] = useState(false);
+  const [authOpen, setAuthOpen] = useState(false);
+  const [setupOpen, setSetupOpen] = useState(false);
+  const [authToken, setAuthToken] = useState(() => window.localStorage.getItem(authTokenKey) || "");
+  const [authStatus, setAuthStatus] = useState<AuthStatus>({ configured: true, required: true, authenticated: false });
   const [theme, setTheme] = useState<ThemeId>(() => {
     const saved = window.localStorage.getItem("hometab.theme.v2");
     return saved === "liquid" || saved === "cyber" || saved === "hacker" || saved === "pixel" || saved === "hud" ? saved : "liquid";
@@ -3549,6 +3913,53 @@ export function App() {
   useEffect(() => {
     setLocalBookmarkOrder(config.bookmarkOrder || []);
   }, [config.bookmarkOrder]);
+
+  async function refreshAuthStatus(token = authToken) {
+    const response = await fetch("/api/auth/status", { headers: authHeaders(token) });
+    const next = (await response.json()) as AuthStatus;
+    setAuthStatus(next);
+    if (!next.configured) setSetupOpen(true);
+    return next;
+  }
+
+  useEffect(() => {
+    void refreshAuthStatus();
+  }, []);
+
+  async function login(password: string) {
+    const response = await fetch("/api/auth/login", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ password })
+    });
+    if (!response.ok) throw new Error(await response.text());
+    const payload = await response.json() as { token: string };
+    setAuthToken(payload.token);
+    window.localStorage.setItem(authTokenKey, payload.token);
+    setAuthOpen(false);
+    await refreshAuthStatus(payload.token);
+    notify("已解锁管理操作。");
+  }
+
+  async function setupPassword(password: string) {
+    const response = await fetch("/api/auth/setup", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...authHeaders(authToken) },
+      body: JSON.stringify({ password })
+    });
+    if (!response.ok) throw new Error(await response.text());
+    setSetupOpen(false);
+    notify("管理密码已设置，请登录后操作。");
+    await refreshAuthStatus();
+    setAuthOpen(true);
+  }
+
+  function requireAuth() {
+    if (!authStatus.required || authStatus.authenticated) return true;
+    setAuthOpen(true);
+    notify("请先输入管理密码。");
+    return false;
+  }
 
   function notify(message: string) {
     setNotice(message);
@@ -3664,6 +4075,13 @@ export function App() {
             lastRefreshAt={lastRefreshAt}
             onRefreshRuntime={refreshRuntime}
             onSyncWebBookmarks={syncWebContainerBookmarks}
+            authToken={authToken}
+            authStatus={authStatus}
+            onRequireAuth={requireAuth}
+            onAuthExpired={() => {
+              setAuthStatus((current) => ({ ...current, authenticated: false }));
+              setAuthOpen(true);
+            }}
             onClearEvents={clearEvents}
             onAuditEvent={addAuditEvent}
             onNotice={notify}
@@ -3703,11 +4121,18 @@ export function App() {
         alertRules={alertRules}
         customCount={customBookmarks.length}
         allBookmarks={bookmarks}
+        authToken={authToken}
+        authStatus={authStatus}
         onSave={updateConfig}
         onOrganizeBookmarks={organizeBookmarks}
         onSaveConnections={updateConnections}
         onSaveAlertRules={updateAlertRules}
         onRefreshRuntime={refreshRuntime}
+        onRequireAuth={requireAuth}
+        onAuthExpired={() => {
+          setAuthStatus((current) => ({ ...current, authenticated: false }));
+          setAuthOpen(true);
+        }}
         onResetBookmarks={async () => {
           await resetCustomBookmarks();
           notify("自定义书签已清空。");
@@ -3715,6 +4140,8 @@ export function App() {
         onClose={() => setSettingsOpen(false)}
       />
       <BackupDialog open={backupOpen} onExport={createBackup} onImport={importBackup} onRestore={restoreBackup} onClose={() => setBackupOpen(false)} />
+      <AuthDialog open={authOpen} onLogin={login} onClose={() => setAuthOpen(false)} />
+      <SetupWizard open={setupOpen} onSetup={setupPassword} onClose={() => setSetupOpen(false)} />
       <Notice message={notice} onClose={() => setNotice("")} />
     </main>
   );

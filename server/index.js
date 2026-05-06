@@ -1,4 +1,5 @@
 import express from "express";
+import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -13,6 +14,11 @@ const dataDir = process.env.DATA_DIR || path.join(rootDir, "data");
 const bookmarksPath = path.join(dataDir, "bookmarks.json");
 const runtimeConfigPath = path.join(dataDir, "config.json");
 const connectionsPath = path.join(dataDir, "connections.json");
+const authPath = path.join(dataDir, "auth.json");
+const sessionsPath = path.join(dataDir, "sessions.json");
+const notificationPath = path.join(dataDir, "notifications.json");
+const auditPath = path.join(dataDir, "audit-log.json");
+const containerBackupDir = path.join(dataDir, "container-backups");
 const backupDir = path.join(dataDir, "backups");
 const port = Number(process.env.PORT || 8080);
 
@@ -96,6 +102,146 @@ function backupFileName(date = new Date()) {
 
 function isSafeBackupName(name) {
   return /^hometab-\d{4}-\d{2}-\d{2}T[\d-]+Z\.json$/.test(String(name || ""));
+}
+
+function nowIso() {
+  return new Date().toISOString();
+}
+
+function hashPassword(password, salt = crypto.randomBytes(16).toString("hex")) {
+  const hash = crypto.pbkdf2Sync(String(password), salt, 120000, 32, "sha256").toString("hex");
+  return { salt, hash };
+}
+
+function verifyPassword(password, record) {
+  if (!record?.salt || !record?.hash) return false;
+  const candidate = hashPassword(password, record.salt).hash;
+  return crypto.timingSafeEqual(Buffer.from(candidate, "hex"), Buffer.from(record.hash, "hex"));
+}
+
+async function getAuthConfig() {
+  return readJson(authPath, {});
+}
+
+async function getSessions() {
+  const sessions = await readJson(sessionsPath, []);
+  const now = Date.now();
+  return sessions.filter((session) => new Date(session.expiresAt).getTime() > now);
+}
+
+async function writeSessions(sessions) {
+  await writeJson(sessionsPath, sessions);
+}
+
+function authTokenFrom(request) {
+  const header = String(request.headers.authorization || "");
+  if (header.startsWith("Bearer ")) return header.slice(7);
+  return String(request.headers["x-hometab-token"] || request.query.token || "");
+}
+
+async function currentSession(request) {
+  const token = authTokenFrom(request);
+  if (!token) return null;
+  const sessions = await getSessions();
+  return sessions.find((session) => session.token === token) || null;
+}
+
+async function authStatus(request) {
+  const auth = await getAuthConfig();
+  const configured = Boolean(auth.hash && auth.salt);
+  return {
+    configured,
+    required: configured,
+    authenticated: configured ? Boolean(await currentSession(request)) : true
+  };
+}
+
+async function requireAuth(request, response) {
+  const status = await authStatus(request);
+  if (!status.required || status.authenticated) return true;
+  response.status(401).json({ error: "Authentication required" });
+  return false;
+}
+
+async function appendAudit(entry) {
+  const current = await readJson(auditPath, []);
+  const next = [{
+    id: `${Date.now()}-${crypto.randomBytes(4).toString("hex")}`,
+    ts: Date.now(),
+    at: nowIso(),
+    ...entry
+  }, ...current].slice(0, 300);
+  await writeJson(auditPath, next);
+  return next[0];
+}
+
+async function getNotificationSettings() {
+  const stored = await readJson(notificationPath, {});
+  return {
+    enabled: stored.enabled ?? process.env.NOTIFY_ENABLED === "true",
+    barkUrl: stored.barkUrl || process.env.BARK_URL || "",
+    serverChanKey: stored.serverChanKey || process.env.SERVER_CHAN_KEY || "",
+    telegramBotToken: stored.telegramBotToken || process.env.TELEGRAM_BOT_TOKEN || "",
+    telegramChatId: stored.telegramChatId || process.env.TELEGRAM_CHAT_ID || "",
+    webhookUrl: stored.webhookUrl || process.env.NOTIFY_WEBHOOK_URL || "",
+    wecomWebhookUrl: stored.wecomWebhookUrl || process.env.WECOM_WEBHOOK_URL || ""
+  };
+}
+
+function publicNotificationSettings(settings) {
+  return {
+    enabled: Boolean(settings.enabled),
+    barkConfigured: Boolean(settings.barkUrl),
+    serverChanConfigured: Boolean(settings.serverChanKey),
+    telegramConfigured: Boolean(settings.telegramBotToken && settings.telegramChatId),
+    webhookConfigured: Boolean(settings.webhookUrl),
+    wecomConfigured: Boolean(settings.wecomWebhookUrl)
+  };
+}
+
+async function sendNotification(title, message, severity = "info") {
+  const settings = await getNotificationSettings();
+  if (!settings.enabled) return { ok: false, skipped: "disabled" };
+  const tasks = [];
+  if (settings.barkUrl) {
+    const url = `${String(settings.barkUrl).replace(/\/$/, "")}/${encodeURIComponent(title)}/${encodeURIComponent(message)}?group=HomeTab&level=${severity === "critical" ? "critical" : "active"}`;
+    tasks.push(fetch(url).then((res) => ({ channel: "bark", ok: res.ok, status: res.status })));
+  }
+  if (settings.serverChanKey) {
+    tasks.push(fetch(`https://sctapi.ftqq.com/${settings.serverChanKey}.send`, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ title, desp: message })
+    }).then((res) => ({ channel: "serverChan", ok: res.ok, status: res.status })));
+  }
+  if (settings.telegramBotToken && settings.telegramChatId) {
+    tasks.push(fetch(`https://api.telegram.org/bot${settings.telegramBotToken}/sendMessage`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ chat_id: settings.telegramChatId, text: `${title}\n${message}` })
+    }).then((res) => ({ channel: "telegram", ok: res.ok, status: res.status })));
+  }
+  if (settings.webhookUrl) {
+    tasks.push(fetch(settings.webhookUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ title, message, severity, source: "HomeTab Pilot", at: nowIso() })
+    }).then((res) => ({ channel: "webhook", ok: res.ok, status: res.status })));
+  }
+  if (settings.wecomWebhookUrl) {
+    tasks.push(fetch(settings.wecomWebhookUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        msgtype: "markdown",
+        markdown: {
+          content: `**${title}**\n\n${message}\n\n> HomeTab Pilot · ${severity} · ${nowIso()}`
+        }
+      })
+    }).then((res) => ({ channel: "wecom", ok: res.ok, status: res.status })));
+  }
+  const results = await Promise.allSettled(tasks);
+  return { ok: results.some((item) => item.status === "fulfilled" && item.value.ok), results };
 }
 
 async function buildBackupPayload() {
@@ -698,6 +844,72 @@ async function getDockerContainerDetail(id) {
   };
 }
 
+function safeContainerName(value) {
+  return String(value || "").replace(/^\//, "").replace(/[^a-zA-Z0-9_.-]/g, "_") || "container";
+}
+
+async function saveContainerBackup(id, reason = "manual") {
+  const inspectOutput = await runFnosDocker(`inspect ${shellQuote(id)}`);
+  const inspect = JSON.parse(inspectOutput)[0];
+  const name = safeContainerName(inspect.Name || id);
+  const payload = { version: 1, reason, exportedAt: nowIso(), inspect };
+  await fs.mkdir(containerBackupDir, { recursive: true });
+  const filename = `${name}-${new Date().toISOString().replace(/[:.]/g, "-")}.json`;
+  await writeJson(path.join(containerBackupDir, filename), payload);
+  return { filename, payload };
+}
+
+function dockerRunArgsFromInspect(inspect) {
+  const args = ["run", "-d", "--name", shellQuote(safeContainerName(inspect.Name))];
+  const hostConfig = inspect.HostConfig || {};
+  const config = inspect.Config || {};
+  if (hostConfig.Privileged) args.push("--privileged");
+  if (hostConfig.RestartPolicy?.Name) args.push("--restart", shellQuote(hostConfig.RestartPolicy.Name));
+  for (const dns of hostConfig.Dns || []) args.push("--dns", shellQuote(dns));
+  for (const [containerPort, bindings] of Object.entries(inspect.NetworkSettings?.Ports || {})) {
+    for (const binding of bindings || []) {
+      args.push("-p", shellQuote(`${binding.HostIp && binding.HostIp !== "0.0.0.0" ? `${binding.HostIp}:` : ""}${binding.HostPort}:${containerPort}`));
+    }
+  }
+  for (const mount of inspect.Mounts || []) {
+    if (mount.Type === "bind") {
+      const suffix = mount.Mode ? `:${mount.Mode}` : "";
+      args.push("-v", shellQuote(`${mount.Source}:${mount.Destination}${suffix}`));
+    }
+  }
+  for (const env of config.Env || []) args.push("-e", shellQuote(env));
+  const networks = Object.keys(inspect.NetworkSettings?.Networks || {}).filter((item) => item !== "bridge");
+  if (networks[0]) args.push("--network", shellQuote(networks[0]));
+  args.push(shellQuote(config.Image || inspect.Config?.Image || inspect.Image));
+  if (Array.isArray(config.Cmd)) args.push(...config.Cmd.map(shellQuote));
+  return args.join(" ");
+}
+
+async function listContainerBackups(id = "") {
+  try {
+    const entries = await fs.readdir(containerBackupDir, { withFileTypes: true });
+    const backups = await Promise.all(entries.filter((entry) => entry.isFile() && entry.name.endsWith(".json")).map(async (entry) => {
+      const filePath = path.join(containerBackupDir, entry.name);
+      const payload = await readJson(filePath, {});
+      const stat = await fs.stat(filePath);
+      return {
+        name: entry.name,
+        exportedAt: payload.exportedAt,
+        reason: payload.reason,
+        container: safeContainerName(payload.inspect?.Name || ""),
+        image: payload.inspect?.Config?.Image || "",
+        mtimeMs: stat.mtimeMs
+      };
+    }));
+    return backups
+      .filter((backup) => !id || backup.container === safeContainerName(id))
+      .sort((a, b) => b.mtimeMs - a.mtimeMs)
+      .slice(0, 20);
+  } catch {
+    return [];
+  }
+}
+
 function diagnosticItem(id, label, ok, detail, level = "error") {
   return {
     id,
@@ -764,6 +976,93 @@ app.get("/api/runtime", async (_request, response) => {
 
 app.get("/api/health", (_request, response) => {
   response.json({ ok: true });
+});
+
+app.get("/api/auth/status", async (request, response) => {
+  response.json(await authStatus(request));
+});
+
+app.post("/api/auth/setup", async (request, response) => {
+  const current = await getAuthConfig();
+  if (current.hash && current.salt && !(await requireAuth(request, response))) return;
+  const password = String(request.body?.password || "");
+  if (password.length < 6) {
+    response.status(400).json({ error: "Password must be at least 6 characters" });
+    return;
+  }
+  await writeJson(authPath, { ...hashPassword(password), createdAt: nowIso() });
+  await appendAudit({ actor: "setup", action: "auth.setup", target: "auth", detail: "管理密码已设置", severity: "info" });
+  response.json({ ok: true });
+});
+
+app.post("/api/auth/login", async (request, response) => {
+  const auth = await getAuthConfig();
+  if (!auth.hash || !auth.salt) {
+    response.status(400).json({ error: "Password is not configured" });
+    return;
+  }
+  if (!verifyPassword(request.body?.password || "", auth)) {
+    await appendAudit({ actor: request.ip, action: "auth.login.failed", target: "auth", detail: "登录失败", severity: "warn" });
+    response.status(401).json({ error: "Invalid password" });
+    return;
+  }
+  const token = crypto.randomBytes(32).toString("hex");
+  const session = { token, createdAt: nowIso(), expiresAt: new Date(Date.now() + 1000 * 60 * 60 * 12).toISOString(), actor: request.ip };
+  await writeSessions([session, ...(await getSessions())].slice(0, 10));
+  await appendAudit({ actor: request.ip, action: "auth.login", target: "auth", detail: "登录成功", severity: "info" });
+  response.json({ ok: true, token, expiresAt: session.expiresAt });
+});
+
+app.post("/api/auth/logout", async (request, response) => {
+  const token = authTokenFrom(request);
+  await writeSessions((await getSessions()).filter((session) => session.token !== token));
+  response.json({ ok: true });
+});
+
+app.get("/api/audit", async (request, response) => {
+  if (!(await requireAuth(request, response))) return;
+  response.json({ events: await readJson(auditPath, []) });
+});
+
+app.get("/api/audit/export", async (request, response) => {
+  if (!(await requireAuth(request, response))) return;
+  response.type("application/json").send(JSON.stringify(await readJson(auditPath, []), null, 2));
+});
+
+app.get("/api/notifications", async (request, response) => {
+  if (!(await requireAuth(request, response))) return;
+  response.json(publicNotificationSettings(await getNotificationSettings()));
+});
+
+app.put("/api/notifications", async (request, response) => {
+  if (!(await requireAuth(request, response))) return;
+  const current = await getNotificationSettings();
+  const next = {
+    enabled: Boolean(request.body?.enabled),
+    barkUrl: request.body?.barkUrl ? String(request.body.barkUrl) : current.barkUrl,
+    serverChanKey: request.body?.serverChanKey ? String(request.body.serverChanKey) : current.serverChanKey,
+    telegramBotToken: request.body?.telegramBotToken ? String(request.body.telegramBotToken) : current.telegramBotToken,
+    telegramChatId: request.body?.telegramChatId ? String(request.body.telegramChatId) : current.telegramChatId,
+    webhookUrl: request.body?.webhookUrl ? String(request.body.webhookUrl) : current.webhookUrl,
+    wecomWebhookUrl: request.body?.wecomWebhookUrl ? String(request.body.wecomWebhookUrl) : current.wecomWebhookUrl
+  };
+  await writeJson(notificationPath, next);
+  await appendAudit({ actor: "admin", action: "notifications.update", target: "notifications", detail: "通知配置已更新", severity: "info" });
+  response.json(publicNotificationSettings(next));
+});
+
+app.post("/api/notifications/test", async (request, response) => {
+  if (!(await requireAuth(request, response))) return;
+  const result = await sendNotification("HomeTab Pilot 测试通知", "通知通道已连通。", "info");
+  response.json(result);
+});
+
+app.post("/api/notifications/event", async (request, response) => {
+  const title = String(request.body?.title || "HomeTab Pilot 告警");
+  const message = String(request.body?.message || request.body?.detail || "");
+  const severity = String(request.body?.severity || "warn");
+  const result = await sendNotification(title, message, severity);
+  response.json(result);
 });
 
 app.get("/api/bookmarks", async (_request, response) => {
@@ -1071,6 +1370,7 @@ app.get("/api/docker/containers/:id", async (request, response) => {
 });
 
 app.post("/api/docker/containers/:id/:action", async (request, response) => {
+  if (!(await requireAuth(request, response))) return;
   const allowed = new Set(["start", "stop", "restart"]);
   if (!allowed.has(request.params.action)) {
     response.status(400).json({ error: "Unsupported action" });
@@ -1078,8 +1378,82 @@ app.post("/api/docker/containers/:id/:action", async (request, response) => {
   }
 
   try {
+    await saveContainerBackup(request.params.id, `before-${request.params.action}`);
     await runFnosDocker(`${request.params.action} ${shellQuote(request.params.id)}`);
+    await appendAudit({ actor: request.ip, action: `docker.${request.params.action}`, target: request.params.id, detail: "Docker action executed", severity: "info" });
+    await sendNotification(`Docker ${request.params.action}`, `${request.params.id} 操作已执行。`, "info");
     response.json({ ok: true });
+  } catch (error) {
+    response.status(500).json({ error: error.message });
+  }
+});
+
+app.get("/api/docker/containers/:id/update", async (request, response) => {
+  try {
+    const detail = await getDockerContainerDetail(request.params.id);
+    const image = detail.image || "";
+    const local = image ? await runFnosDocker(`image inspect ${shellQuote(image)} --format '{{json .Id}} {{json .RepoDigests}}'`).catch(() => "") : "";
+    response.json({ ok: true, image, local, backups: await listContainerBackups(detail.name || request.params.id) });
+  } catch (error) {
+    response.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/api/docker/containers/:id/pull", async (request, response) => {
+  if (!(await requireAuth(request, response))) return;
+  try {
+    const detail = await getDockerContainerDetail(request.params.id);
+    await saveContainerBackup(request.params.id, "before-pull");
+    const output = await runFnosDocker(`pull ${shellQuote(detail.image)}`);
+    await appendAudit({ actor: request.ip, action: "docker.pull", target: detail.name || request.params.id, detail: detail.image, severity: "info" });
+    await sendNotification("Docker 镜像已拉取", `${detail.name || request.params.id} · ${detail.image}`, "info");
+    response.json({ ok: true, image: detail.image, output });
+  } catch (error) {
+    response.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/api/docker/containers/:id/recreate", async (request, response) => {
+  if (!(await requireAuth(request, response))) return;
+  try {
+    const backup = await saveContainerBackup(request.params.id, "before-recreate");
+    const inspect = backup.payload.inspect;
+    const name = safeContainerName(inspect.Name);
+    const runArgs = dockerRunArgsFromInspect(inspect);
+    await runFnosDocker(`rm -f ${shellQuote(name)}`);
+    const output = await runFnosDocker(runArgs);
+    await appendAudit({ actor: request.ip, action: "docker.recreate", target: name, detail: backup.filename, severity: "warn" });
+    await sendNotification("Docker 容器已重建", `${name} 已根据备份配置重建。`, "warn");
+    response.json({ ok: true, backup: backup.filename, output });
+  } catch (error) {
+    response.status(500).json({ error: error.message });
+  }
+});
+
+app.get("/api/docker/backups", async (request, response) => {
+  if (!(await requireAuth(request, response))) return;
+  response.json({ backups: await listContainerBackups(request.query.container || "") });
+});
+
+app.post("/api/docker/backups/:name/rollback", async (request, response) => {
+  if (!(await requireAuth(request, response))) return;
+  const name = String(request.params.name || "");
+  if (!/^[a-zA-Z0-9_.-]+-\d{4}-\d{2}-\d{2}T[\d-]+Z\.json$/.test(name)) {
+    response.status(400).json({ error: "Invalid backup name" });
+    return;
+  }
+  const payload = await readJson(path.join(containerBackupDir, name), null);
+  if (!payload?.inspect) {
+    response.status(404).json({ error: "Backup not found" });
+    return;
+  }
+  try {
+    const containerName = safeContainerName(payload.inspect.Name);
+    const runArgs = dockerRunArgsFromInspect(payload.inspect);
+    await runFnosDocker(`rm -f ${shellQuote(containerName)}`);
+    const output = await runFnosDocker(runArgs);
+    await appendAudit({ actor: request.ip, action: "docker.rollback", target: containerName, detail: name, severity: "warn" });
+    response.json({ ok: true, output });
   } catch (error) {
     response.status(500).json({ error: error.message });
   }
@@ -1100,6 +1474,7 @@ app.get("/api/pve/status", async (_request, response) => {
 });
 
 app.post("/api/pve/:node/:type/:vmid/:action", async (request, response) => {
+  if (!(await requireAuth(request, response))) return;
   const allowed = new Set(["start", "shutdown", "reboot", "stop"]);
   const { node, type, vmid, action } = request.params;
   if (!allowed.has(action) || !["qemu", "lxc"].includes(type)) {
@@ -1112,6 +1487,8 @@ app.post("/api/pve/:node/:type/:vmid/:action", async (request, response) => {
       `/nodes/${encodeURIComponent(node)}/${type}/${encodeURIComponent(vmid)}/status/${action}`,
       { method: "POST" }
     );
+    await appendAudit({ actor: request.ip, action: `pve.${action}`, target: `${type}/${vmid}`, detail: node, severity: action === "stop" ? "warn" : "info" });
+    await sendNotification(`PVE ${action}`, `${type.toUpperCase()} ${vmid} 操作已提交。`, action === "stop" ? "warn" : "info");
     response.json({ ok: true, data });
   } catch (error) {
     response.status(500).json({ error: error.message });
