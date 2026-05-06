@@ -108,7 +108,7 @@ type RuntimeStatus = {
       pids?: string;
       portsText?: string;
       health?: string;
-      accessUrls?: Array<{ label: string; url: string; hostPort: string }>;
+      accessUrls?: Array<{ label: string; url: string; hostPort: string; webStatus?: "ok" | "warn" | "error"; httpStatus?: number; latencyMs?: number; checkedAt?: string; error?: string }>;
       restartPolicy?: string;
     }>;
     error?: string;
@@ -128,6 +128,16 @@ type RuntimePayload = {
   status: RuntimeStatus;
   generatedAt?: string;
   diagnostics?: DiagnosticCheck[];
+};
+
+type SyncWebBookmarksPayload = {
+  ok: boolean;
+  category: string;
+  synced: number;
+  bookmarks: Bookmark[];
+  config: AppConfig;
+  items: Bookmark[];
+  checkedAt: string;
 };
 
 type ConnectionSettings = {
@@ -307,17 +317,22 @@ function getLogoCandidates(bookmark: Pick<Bookmark, "url" | "logoUrl">) {
   const url = normalizeUrl(bookmark.url);
   const candidates: string[] = [];
 
-  if (bookmark.logoUrl) candidates.push(bookmark.logoUrl);
-
   try {
     const parsed = new URL(url);
     const host = parsed.hostname;
-    const isLocalHost = host.endsWith(".local") || host.endsWith(".lan") || !host.includes(".");
-    if (isLocalHost && bookmark.logoUrl) {
-      return [...new Set(candidates.filter(Boolean))];
+    const isPrivateHost = host.endsWith(".local")
+      || host.endsWith(".lan")
+      || host === "localhost"
+      || !host.includes(".")
+      || /^10\./.test(host)
+      || /^192\.168\./.test(host)
+      || /^172\.(1[6-9]|2\d|3[0-1])\./.test(host);
+    if (bookmark.logoUrl) {
+      const logoHost = new URL(bookmark.logoUrl, parsed.origin).hostname;
+      if (!isPrivateHost || logoHost !== host) candidates.push(bookmark.logoUrl);
     }
-    if (isLocalHost) {
-      return [];
+    if (isPrivateHost) {
+      return [...new Set(candidates.filter(Boolean))];
     }
     candidates.push(`${parsed.origin}/favicon.ico`);
     candidates.push(`${parsed.origin}/apple-touch-icon.png`);
@@ -554,6 +569,13 @@ function healthText(value?: string) {
     starting: "启动中"
   };
   return map[value] || value;
+}
+
+function webStatusText(value?: string, httpStatus?: number) {
+  if (value === "ok") return httpStatus ? `HTTP ${httpStatus}` : "可访问";
+  if (value === "warn") return httpStatus ? `HTTP ${httpStatus}` : "需检查";
+  if (value === "error") return "不可达";
+  return "未检测";
 }
 
 function cleanLogLine(line: string) {
@@ -977,6 +999,20 @@ function useRuntime() {
     ]);
   }
 
+  async function syncWebContainerBookmarks() {
+    const response = await fetch("/api/bookmarks/sync-web-containers", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ category: "NAS" })
+    });
+    if (!response.ok) throw new Error(await response.text());
+    const payload = (await response.json()) as SyncWebBookmarksPayload;
+    setCustomBookmarks(payload.bookmarks);
+    setConfig(payload.config);
+    writeLocalBookmarks(payload.bookmarks);
+    return payload;
+  }
+
   async function createBackup() {
     try {
       const response = await fetch("/api/backup");
@@ -1075,6 +1111,7 @@ function useRuntime() {
     resetCustomBookmarks,
     updateConfig,
     organizeBookmarks,
+    syncWebContainerBookmarks,
     updateConnections,
     createBackup,
     restoreBackup,
@@ -1580,6 +1617,7 @@ function SystemCards({
   events,
   lastRefreshAt,
   onRefreshRuntime,
+  onSyncWebBookmarks,
   onClearEvents,
   onAuditEvent,
   onNotice
@@ -1591,6 +1629,7 @@ function SystemCards({
   events: RuntimeEvent[];
   lastRefreshAt: string;
   onRefreshRuntime: () => Promise<void>;
+  onSyncWebBookmarks: () => Promise<SyncWebBookmarksPayload>;
   onClearEvents: () => void;
   onAuditEvent: (title: string, detail: string, severity?: EventSeverity) => void;
   onNotice: (message: string) => void;
@@ -1603,6 +1642,7 @@ function SystemCards({
   const [pendingContainerAction, setPendingContainerAction] = useState<{ action: "stop" | "restart"; label: string; container: DockerService } | null>(null);
   const [pendingPveAction, setPendingPveAction] = useState<{ action: PveAction; label: string; vm: PveVm } | null>(null);
   const [executingAction, setExecutingAction] = useState("");
+  const [syncingWebBookmarks, setSyncingWebBookmarks] = useState(false);
   const [pveActionMessage, setPveActionMessage] = useState("");
   const fnos = status.fnos || {
     available: true,
@@ -1634,6 +1674,8 @@ function SystemCards({
   const pveBookmark = config.bookmarks.find((bookmark) => bookmark.name === "PVE");
   const pveVms = status.pve?.vms || [];
   const dockerOperations = events.filter((event) => event.source === "Audit" && event.title.startsWith("Docker")).slice(0, 5);
+  const webContainerCount = containers.filter((container) => container.accessUrls?.length).length;
+  const webReachableCount = containers.filter((container) => container.accessUrls?.some((access) => access.webStatus === "ok")).length;
 
   function selectContainer(container: DockerService) {
     if (container.id) setSelectedContainerId(container.id);
@@ -1750,6 +1792,26 @@ function SystemCards({
     }
   }
 
+  async function syncWebBookmarks() {
+    setSyncingWebBookmarks(true);
+    onAuditEvent("Docker Web书签同步已提交", `${webContainerCount} 个容器带访问地址`);
+    try {
+      const payload = await onSyncWebBookmarks();
+      const message = `已同步 ${payload.synced} 个 Web 容器到 ${payload.category} 分组。`;
+      setActionMessage(message);
+      onNotice(message);
+      onAuditEvent("Docker Web书签同步成功", message);
+      await onRefreshRuntime();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Web 容器书签同步失败。";
+      setActionMessage(message);
+      onNotice(message);
+      onAuditEvent("Docker Web书签同步失败", message, "warn");
+    } finally {
+      setSyncingWebBookmarks(false);
+    }
+  }
+
   return (
     <section className="ops-workbench" aria-label="系统管理">
       <div className="device-grid">
@@ -1805,9 +1867,17 @@ function SystemCards({
           <div className="docker-summary">
             <span><i />运行中 {runningContainers}</span>
             <span>总数 {status.docker?.total ?? containers.length}</span>
+            <span>Web {webReachableCount}/{webContainerCount}</span>
           </div>
         </div>
         {status.docker?.error ? <p className="action-message">{status.docker.error}</p> : null}
+        <div className="docker-tools">
+          <button type="button" disabled={syncingWebBookmarks || !webContainerCount} onClick={syncWebBookmarks}>
+            <UiIcon name="bookmark" />
+            {syncingWebBookmarks ? "同步中" : "同步Web书签到NAS"}
+          </button>
+          <span>{webContainerCount ? `发现 ${webContainerCount} 个带访问地址的容器` : "暂无可同步 Web 容器"}</span>
+        </div>
         <DockerOperationHistory events={dockerOperations} />
 
         <div className="container-table" role="table" aria-label="飞牛 OS Docker 容器列表">
@@ -1835,7 +1905,10 @@ function SystemCards({
                 </button>
                 <ResourceMeter className="resource-meter--cpu" value={readPercent(service.cpu)} label={service.cpu || "0%"} />
                 <ResourceMeter className="resource-meter--memory" value={readPercent(service.memory)} label={service.memory || "0%"} />
-                <span className="visit-chip">{service.accessUrls?.[0]?.hostPort || "-"}</span>
+                <span className={`visit-chip visit-chip--${service.accessUrls?.[0]?.webStatus || "unknown"}`} title={webStatusText(service.accessUrls?.[0]?.webStatus, service.accessUrls?.[0]?.httpStatus)}>
+                  {service.accessUrls?.[0]?.hostPort || "-"}
+                  {service.accessUrls?.[0]?.webStatus ? <small>{webStatusText(service.accessUrls[0].webStatus, service.accessUrls[0].httpStatus)}</small> : null}
+                </span>
                 <span className="row-actions">
                   <button type="button" aria-label={`打开 ${service.name} 访问地址`} disabled={!firstUrl || Boolean(executingAction)} onClick={() => openUrl(firstUrl)}>
                     <UiIcon name="open" />
@@ -2377,6 +2450,10 @@ function ContainerDetailPanel({
             container.accessUrls.slice(0, 3).map((item) => (
               <button key={item.url} type="button" onClick={() => openUrl(item.url)}>
                 {item.url}
+                <small className={`web-status web-status--${item.webStatus || "unknown"}`}>
+                  {webStatusText(item.webStatus, item.httpStatus)}
+                  {item.latencyMs ? ` · ${item.latencyMs}ms` : ""}
+                </small>
               </button>
             ))
           ) : (
@@ -2424,10 +2501,14 @@ function ContainerConfigDialog({ detail, onClose }: { detail: Record<string, unk
           <InfoBlock title="访问地址">
             {links.length ? (
               links.map((item) => {
-                const link = item as { url?: string; label?: string; hostPort?: string };
+                const link = item as { url?: string; label?: string; hostPort?: string; webStatus?: string; httpStatus?: number; latencyMs?: number };
                 return (
                   <button key={link.url} type="button" onClick={() => openUrl(link.url)}>
                     {link.url}
+                    <small className={`web-status web-status--${link.webStatus || "unknown"}`}>
+                      {webStatusText(link.webStatus, link.httpStatus)}
+                      {link.latencyMs ? ` · ${link.latencyMs}ms` : ""}
+                    </small>
                   </button>
                 );
               })
@@ -3439,6 +3520,7 @@ export function App() {
     resetCustomBookmarks,
     updateConfig,
     organizeBookmarks,
+    syncWebContainerBookmarks,
     updateConnections,
     createBackup,
     restoreBackup,
@@ -3581,6 +3663,7 @@ export function App() {
             events={events}
             lastRefreshAt={lastRefreshAt}
             onRefreshRuntime={refreshRuntime}
+            onSyncWebBookmarks={syncWebContainerBookmarks}
             onClearEvents={clearEvents}
             onAuditEvent={addAuditEvent}
             onNotice={notify}

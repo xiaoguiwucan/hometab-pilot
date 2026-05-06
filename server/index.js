@@ -519,6 +519,68 @@ function dockerAccessUrls(inspect, connection) {
   return [...new Map(urls.map((item) => [item.url, item])).values()];
 }
 
+function dockerBookmarkName(name) {
+  const presets = {
+    clouddrive2: "CloudDrive2",
+    mdc: "MDC",
+    "new-api": "New API",
+    db_online: "DB Online",
+    "byte-muse": "Byte Muse",
+    flaresolverr: "FlareSolverr",
+    immortal: "Immortal"
+  };
+  if (presets[name]) return presets[name];
+  return String(name || "container")
+    .split(/[-_]/)
+    .filter(Boolean)
+    .map((part) => part.slice(0, 1).toUpperCase() + part.slice(1))
+    .join(" ");
+}
+
+async function checkWebAccess(url) {
+  const startedAt = Date.now();
+  try {
+    const response = await fetch(url, {
+      method: "GET",
+      redirect: "manual",
+      signal: AbortSignal.timeout(1600)
+    });
+    const latencyMs = Date.now() - startedAt;
+    return {
+      webStatus: response.status >= 500 ? "error" : response.status >= 400 ? "warn" : "ok",
+      httpStatus: response.status,
+      latencyMs,
+      checkedAt: new Date().toISOString()
+    };
+  } catch (error) {
+    return {
+      webStatus: "error",
+      httpStatus: 0,
+      latencyMs: Date.now() - startedAt,
+      checkedAt: new Date().toISOString(),
+      error: error.name === "TimeoutError" ? "timeout" : error.message
+    };
+  }
+}
+
+async function withWebAccessChecks(services) {
+  const checks = new Map();
+  await Promise.all(
+    services.flatMap((service) =>
+      (service.accessUrls || []).slice(0, 3).map(async (access) => {
+        checks.set(access.url, await checkWebAccess(access.url));
+      })
+    )
+  );
+  return services.map((service) => ({
+    ...service,
+    accessUrls: (service.accessUrls || []).map((access) => ({
+      ...access,
+      ...(checks.get(access.url) || {})
+    }))
+  }));
+}
+
 function redactEnv(env = []) {
   const secretPattern = /(PASS|PASSWORD|TOKEN|SECRET|KEY|AUTH|COOKIE|CREDENTIAL)/i;
   return env.map((item) => {
@@ -587,13 +649,14 @@ async function getDockerStatus() {
         restartPolicy: detail.restartPolicy || ""
         };
       });
+    const servicesWithWebChecks = await withWebAccessChecks(services);
 
     return {
       available: true,
       source: "fnos-ssh",
-      running: services.filter((container) => container.state === "running").length,
-      total: services.length,
-      services
+      running: servicesWithWebChecks.filter((container) => container.state === "running").length,
+      total: servicesWithWebChecks.length,
+      services: servicesWithWebChecks
     };
   } catch (error) {
     return {
@@ -617,6 +680,12 @@ async function getDockerContainerDetail(id) {
     .catch(() => ({}));
   return {
     ...slimInspect(inspect, connection),
+    accessUrls: await Promise.all(
+      (slimInspect(inspect, connection).accessUrls || []).map(async (access) => ({
+        ...access,
+        ...(await checkWebAccess(access.url))
+      }))
+    ),
     state: inspect.State,
     stats: {
       cpu: stats.CPUPerc || "",
@@ -751,6 +820,70 @@ app.put("/api/bookmarks", async (request, response) => {
 
   await writeJson(bookmarksPath, normalized);
   response.json({ ok: true, bookmarks: normalized });
+});
+
+app.post("/api/bookmarks/sync-web-containers", async (request, response) => {
+  const category = String(request.body?.category || "NAS").trim() || "NAS";
+  const dockerStatus = await getDockerStatus();
+  if (!dockerStatus.available) {
+    response.status(503).json({ error: dockerStatus.error || "Docker is not available" });
+    return;
+  }
+
+  const config = await getConfig();
+  const currentBookmarks = await getBookmarks();
+  const defaultUrls = new Set((config.bookmarks || []).map((bookmark) => normalizeUrl(bookmark.url)));
+  const colors = ["cyan", "teal", "violet", "sage", "blue", "rose", "amber", "green"];
+  const webBookmarks = dockerStatus.services
+    .filter((service) => service.state === "running" && service.accessUrls?.length)
+    .map((service, index) => {
+      const access = service.accessUrls[0];
+      const displayName = dockerBookmarkName(service.name);
+      return {
+        name: displayName || service.name,
+        url: access.url,
+        category,
+        icon: (displayName || service.name || "C").slice(0, 1).toUpperCase(),
+        color: colors[index % colors.length],
+        logoUrl: "",
+        status: access.webStatus === "error" ? "warning" : "online"
+      };
+    })
+    .filter((bookmark) => bookmark.url && !defaultUrls.has(normalizeUrl(bookmark.url)));
+
+  const syncedUrls = new Set(webBookmarks.map((bookmark) => normalizeUrl(bookmark.url)));
+  const nextBookmarks = [
+    ...webBookmarks,
+    ...currentBookmarks.filter((bookmark) => !syncedUrls.has(normalizeUrl(bookmark.url)))
+  ].slice(0, 80);
+  const orderUrls = new Set();
+  const bookmarkOrder = [
+    ...webBookmarks.map((bookmark) => bookmark.url),
+    ...(config.bookmarkOrder || []),
+    ...(config.bookmarks || []).filter((bookmark) => bookmark.name !== "添加").map((bookmark) => bookmark.url)
+  ].filter((url) => {
+    const key = normalizeUrl(url);
+    if (!key || orderUrls.has(key)) return false;
+    orderUrls.add(key);
+    return true;
+  });
+  const nextConfig = {
+    ...config,
+    categories: config.categories?.includes(category) ? config.categories : [...(config.categories || []), category],
+    bookmarkOrder
+  };
+
+  await createBackupSnapshot({ version: 1, exportedAt: new Date().toISOString(), config, customBookmarks: currentBookmarks });
+  await Promise.all([writeJson(bookmarksPath, nextBookmarks), writeJson(runtimeConfigPath, nextConfig)]);
+  response.json({
+    ok: true,
+    category,
+    synced: webBookmarks.length,
+    bookmarks: nextBookmarks,
+    config: nextConfig,
+    items: webBookmarks,
+    checkedAt: new Date().toISOString()
+  });
 });
 
 app.delete("/api/bookmarks", async (request, response) => {

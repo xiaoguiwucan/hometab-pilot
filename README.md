@@ -361,4 +361,4 @@ curl http://127.0.0.1:8088/api/health
 
 ## 许可证
 
-如果你要公开分发，建议在仓库中补充明确的开源许可证，例如 MIT。
+本项目基于 [MIT License](LICENSE) 开源。
