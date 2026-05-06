@@ -2,6 +2,9 @@
 
 HomeTab Pilot 是一个面向 NAS、Homelab 和个人服务器场景的自托管导航页。它不只是书签墙，还把飞牛 OS、PVE、Docker 容器状态、日志、资源占用和常用管理操作整合到同一个首页里，适合放在浏览器新标签页、NAS 首页、软路由首页或家庭服务器入口。
 
+当前版本：`v0.2.0`  
+更新记录：[CHANGELOG.md](CHANGELOG.md) · GitHub Releases：[v0.2.0](https://github.com/xiaoguiwucan/hometab-pilot/releases/tag/v0.2.0)
+
 ## 效果预览
 
 ![HomeTab Pilot HUD 主题总览](docs/images/overview-hud.png)
@@ -24,8 +27,11 @@ HomeTab Pilot 是一个面向 NAS、Homelab 和个人服务器场景的自托管
 
 ## 项目特色
 
+- 版本化发布：GitHub Releases 和 Docker Hub 镜像标签按版本区分，支持 `latest` 与固定版本回滚。
 - 真实设备面板：通过飞牛 OS SSH、PVE API 拉取实时状态，不是静态演示数据。
 - Docker 容器管理：展示容器运行状态、CPU、内存、网络、端口访问地址、日志和配置，并支持重启、停止等操作。
+- Web 容器同步：一键发现飞牛 OS Docker 中可访问的 Web 容器，并同步到 `NAS` 书签分组。
+- 服务健康检查：容器 Web 地址展示 HTTP 状态和延迟，快速判断服务是否真的可访问。
 - PVE 实例管理：显示 QEMU / LXC 实例状态、CPU、内存，并提供启动、关机、重启、强停等快捷动作。
 - 5 秒自动刷新：运行时状态定时刷新，曲线和资源占用会随真实数据更新。
 - 多主题 UI：内置 macOS 流体玻璃、赛博朋克、黑客代码、16bit、HUD 等主题。
@@ -111,7 +117,7 @@ docker run -d \
   -p 8088:8080 \
   -v hometab-data:/data \
   --env-file .env \
-  xiaoguiwucan0426/hometab-pilot:latest
+  xiaoguiwucan0426/hometab-pilot:0.2.0
 ```
 
 访问：
@@ -284,6 +290,13 @@ docker compose up -d
 ## 发布到 Docker Hub
 
 本仓库内置 GitHub Actions 工作流：推送到 `main` 后自动构建并发布多架构镜像。
+
+推荐生产部署使用固定版本标签，方便回滚：
+
+```bash
+docker pull xiaoguiwucan0426/hometab-pilot:0.2.0
+docker pull xiaoguiwucan0426/hometab-pilot:latest
+```
 
 在 GitHub 仓库设置中添加 Actions secrets：
 
