@@ -1,164 +1,330 @@
 # HomeTab Pilot
 
-一个以书签网站导航为主、兼容飞牛 OS / PVE / Docker 容器管理入口的新标签页项目。支持书签管理、主题切换、运行时备份恢复，以及通过飞牛 OS SSH / PVE API 读取真实设备和容器状态。
+HomeTab Pilot 是一个面向 NAS、Homelab 和个人服务器场景的自托管导航页。它不只是书签墙，还把飞牛 OS、PVE、Docker 容器状态、日志、资源占用和常用管理操作整合到同一个首页里，适合放在浏览器新标签页、NAS 首页、软路由首页或家庭服务器入口。
 
-## 功能
+## 项目特色
 
-- iTab 风格书签导航：首页中心是 5x3 常用网站入口。
-- 分类标签：常用、NAS、AI、下载、影音、开发、工具、生活。
-- 左侧导航：添加网址、导入书签、主题、设置、备份等常用操作集中在侧栏。
-- 右侧管理：飞牛 OS、PVE、Docker 容器状态与快捷动作。
-- 运行时配置：支持页面设置、数据卷持久化和备份恢复。
-- 官方 Logo：默认服务优先使用品牌 SVG / 官方 favicon，不再使用手绘替代图标。
-- 自动取 Logo：点击“添加”后粘贴网址，会自动尝试从 favicon / Apple touch icon / favicon 服务提取 Logo。
-- 可用交互：分类筛选、搜索直达/网页搜索、组件显示开关、壁纸切换、运行时设置、备份导入导出。
-- 书签管理：添加、删除、右键编辑、批量导入；自定义书签保存到后端数据卷，静态预览时回退到浏览器 localStorage。
-- Docker 部署：支持 x86_64 / arm64，适合 PVE、飞牛 OS、NAS、软路由环境。
-- 后端 API：同一容器提供 `/api/runtime`、书签持久化、运行时配置保存、备份恢复、飞牛 OS Docker 容器列表/日志/操作、PVE API 代理。
+- 真实设备面板：通过飞牛 OS SSH、PVE API 拉取实时状态，不是静态演示数据。
+- Docker 容器管理：展示容器运行状态、CPU、内存、网络、端口访问地址、日志和配置，并支持重启、停止等操作。
+- PVE 实例管理：显示 QEMU / LXC 实例状态、CPU、内存，并提供启动、关机、重启、强停等快捷动作。
+- 5 秒自动刷新：运行时状态定时刷新，曲线和资源占用会随真实数据更新。
+- 多主题 UI：内置 macOS 流体玻璃、赛博朋克、黑客代码、16bit、HUD 等主题。
+- 书签管理：支持新增、右键编辑、删除、拖拽排序、分类移动、批量导入。
+- 自动 Logo：优先使用内置品牌图标、官方 favicon、Apple touch icon 和 favicon 服务。
+- 备份恢复：页面内导出和导入配置，适合迁移或重装后恢复。
+- 自适应布局：适配桌面、宽屏、窄屏和移动视口，避免横向溢出。
+- Docker 部署：单容器运行，数据持久化到 `/data`，支持 amd64 / arm64。
 
-## 本地开发
+## 功能总览
+
+### 书签导航
+
+- 分类：常用、NAS、AI、下载、影音、开发、工具、生活，可在设置中调整。
+- 搜索：支持搜索站点名称或 URL，也可以直接进行网页搜索。
+- 编辑：书签支持右键编辑，也可以在卡片上使用编辑按钮。
+- 导入：支持 JSON 数组，或每行一个 `名称 URL` 的纯文本格式。
+- 排序：支持保存书签顺序，部署模式写入数据卷。
+
+### 飞牛 OS
+
+- HTTP 连通检测。
+- SSH 连通检测。
+- CPU、内存、存储占用。
+- Docker 容器列表、资源占用、端口、日志、配置。
+- 容器重启、停止等操作。
+
+### PVE
+
+- 支持账号密码登录。
+- 支持 API Token。
+- 读取节点 CPU、内存、存储。
+- 展示 QEMU / LXC 实例。
+- 支持启动、关机、重启、强停等操作。
+
+### 运行时与安全
+
+- 敏感信息只放在 `.env` 或页面设置保存的数据卷中。
+- 密码不会写入前端静态文件。
+- 设置页不会回显已保存密码，留空代表不修改。
+- 危险操作带确认流程。
+- `.env`、备份、截图、构建产物默认不会进入 Git 或 Docker 镜像。
+
+## 快速开始
+
+### 方式一：Docker Compose
+
+```bash
+git clone https://github.com/xiaoguiwucan/hometab-pilot.git
+cd hometab-pilot
+cp .env.example .env
+docker compose up -d
+```
+
+访问：
+
+```text
+http://服务器IP:8088
+```
+
+### 方式二：Docker Hub 镜像
+
+镜像发布后可以直接运行：
+
+```bash
+docker run -d \
+  --name hometab-pilot \
+  --restart unless-stopped \
+  -p 8088:8080 \
+  -v hometab-data:/data \
+  --env-file .env \
+  xiaoguiwucan/hometab-pilot:latest
+```
+
+访问：
+
+```text
+http://服务器IP:8088
+```
+
+### 方式三：本地开发
 
 ```bash
 npm install
 npm run dev
 ```
 
-访问 `http://localhost:5173`。
+访问：
 
-## Docker 部署
-
-```bash
-docker compose up -d --build
+```text
+http://localhost:5173
 ```
 
-访问 `http://服务器IP:8088`。
+## 环境变量
 
-部署后会创建：
-
-- Web 服务：`hometab-pilot`
-- 访问端口：`8088`
-- 数据卷：`hometab-data`
-- Docker 管理：通过飞牛 OS SSH 读取和操作远端容器
-
-## 真实管理配置
-
-复制并编辑 `.env`：
+复制 `.env.example`：
 
 ```bash
 cp .env.example .env
 ```
+
+常用配置：
+
+| 变量 | 说明 | 示例 |
+| --- | --- | --- |
+| `PORT` | 容器内服务端口 | `8080` |
+| `DATA_DIR` | 持久化数据目录 | `/data` |
+| `FNOS_URL` | 飞牛 OS Web 地址 | `http://192.168.1.10:5666` |
+| `FNOS_SSH_HOST` | 飞牛 OS SSH 主机 | `192.168.1.10` |
+| `FNOS_SSH_PORT` | 飞牛 OS SSH 端口 | `22` |
+| `FNOS_SSH_USERNAME` | 飞牛 OS SSH 用户 | `user` |
+| `FNOS_SSH_PASSWORD` | 飞牛 OS SSH 密码 | 留在 `.env` 中 |
+| `PVE_URL` | PVE 地址 | `https://192.168.1.20:8006` |
+| `PVE_USERNAME` | PVE 用户 | `root@pam` |
+| `PVE_PASSWORD` | PVE 密码 | 留在 `.env` 中 |
+| `PVE_TOKEN_ID` | PVE API Token ID | `root@pam!hometab` |
+| `PVE_TOKEN_SECRET` | PVE API Token Secret | 留在 `.env` 中 |
+| `PVE_TLS_VERIFY` | 是否校验证书 | `false` |
+
+PVE 可以二选一：
+
+- 使用 `PVE_USERNAME` + `PVE_PASSWORD`
+- 使用 `PVE_TOKEN_ID` + `PVE_TOKEN_SECRET`
+
+建议生产环境优先使用 PVE API Token，并给 Token 分配最小权限。
+
+## Docker Compose 示例
+
+```yaml
+services:
+  hometab:
+    image: xiaoguiwucan/hometab-pilot:latest
+    container_name: hometab-pilot
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "8088:8080"
+    volumes:
+      - hometab-data:/data
+
+volumes:
+  hometab-data:
+```
+
+如果你想从源码构建，把 `image` 替换为：
+
+```yaml
+build:
+  context: .
+  dockerfile: Dockerfile
+image: hometab-pilot:latest
+```
+
+## 飞牛 OS 接入步骤
+
+1. 确认飞牛 OS 已开启 SSH。
+2. 确认用于连接的用户可以执行 Docker 命令。
+3. 在 `.env` 中填写：
+
+```bash
+FNOS_URL=http://你的飞牛OS地址:端口
+FNOS_SSH_HOST=你的飞牛OS地址
+FNOS_SSH_PORT=22
+FNOS_SSH_USERNAME=你的用户名
+FNOS_SSH_PASSWORD=你的密码
+```
+
+4. 重启服务：
+
+```bash
+docker compose up -d
+```
+
+5. 打开页面右侧 Docker 面板，确认容器列表、资源占用、日志按钮可用。
+
+## PVE 接入步骤
+
+### 使用账号密码
 
 ```bash
 PVE_URL=https://你的PVE地址:8006
 PVE_USERNAME=root@pam
 PVE_PASSWORD=你的密码
 PVE_TLS_VERIFY=false
-FNOS_URL=http://你的飞牛OS地址
-FNOS_SSH_HOST=你的飞牛OS地址
-FNOS_SSH_USERNAME=你的用户名
-FNOS_SSH_PASSWORD=你的密码
 ```
 
-修改后重启：
+### 使用 API Token
+
+```bash
+PVE_URL=https://你的PVE地址:8006
+PVE_TOKEN_ID=root@pam!hometab
+PVE_TOKEN_SECRET=你的TokenSecret
+PVE_TLS_VERIFY=false
+```
+
+重启服务：
 
 ```bash
 docker compose up -d
 ```
 
-注意：PVE 和飞牛 OS 的账号密码不要写进 `public/config.json`，它会被前端访问；敏感信息只放 `.env` 或页面“设置”里的连接配置。页面不会回显已保存的密码。
+打开页面右侧 PVE 面板，确认节点状态和 VM/LXC 列表可用。
 
-当前后端支持：
+## 数据目录
 
-- PVE：账号密码登录或 API Token 登录，读取节点、VM、LXC 数据。
-- 飞牛 OS：HTTP 连通检测，SSH 读取 CPU、内存、根分区磁盘占用。
+容器内 `/data` 保存运行时数据：
 
-## 多架构镜像
+- 自定义书签
+- 分类和排序
+- 连接配置
+- 备份记录
+- 告警规则
 
-构建同时支持 x86 和 ARM 的镜像：
-
-```bash
-docker buildx build \
-  --platform linux/amd64,linux/arm64 \
-  -t your-registry/hometab-pilot:latest \
-  --push .
-```
-
-如果只在本机使用：
+推荐使用 Docker volume：
 
 ```bash
-docker build -t hometab-pilot:latest .
-docker run -d --name hometab-pilot --restart unless-stopped -p 8088:8080 hometab-pilot:latest
+-v hometab-data:/data
 ```
+
+如果希望绑定到宿主机目录：
+
+```bash
+-v /你的目录/hometab-data:/data
+```
+
+## 备份与恢复
+
+页面左侧点击“备份”：
+
+- 导出：下载包含配置和自定义书签的 JSON 文件。
+- 导入：恢复导出的 JSON 文件。
+- 服务端备份：部署模式会保存在 `/data/backups`。
+
+迁移到新机器时：
+
+1. 部署新容器。
+2. 复制旧的 `/data` 目录，或在页面导入备份 JSON。
+3. 检查 `.env` 中的连接配置。
+4. 重启容器。
 
 ## 发布到 Docker Hub
 
-本仓库内置 GitHub Actions 工作流：推送到 `main` 后会构建并发布多架构镜像。
+本仓库内置 GitHub Actions 工作流：推送到 `main` 后自动构建并发布多架构镜像。
 
-在 GitHub 仓库设置 `Settings -> Secrets and variables -> Actions` 中添加：
+在 GitHub 仓库设置中添加 Actions secrets：
 
-- `DOCKERHUB_USERNAME`：Docker Hub 用户名
-- `DOCKERHUB_TOKEN`：Docker Hub Access Token
+- `DOCKERHUB_USERNAME`
+- `DOCKERHUB_TOKEN`
 
-然后推送 `main` 分支即可发布：
+然后推送：
 
 ```bash
 git push -u origin main
 ```
 
-手动本地发布：
+本地手动发布：
 
 ```bash
 docker buildx build \
   --platform linux/amd64,linux/arm64 \
-  -t DOCKERHUB_USERNAME/hometab-pilot:latest \
+  -t xiaoguiwucan/hometab-pilot:latest \
   --push .
 ```
 
-## 配置书签
+## 手动构建
 
-编辑 `public/config.json`，可以调整：
+```bash
+npm run build
+docker build -t hometab-pilot:latest .
+```
 
-- `categories`：顶部分类。
-- `bookmarks`：中心书签图标。
-- `folders`：左侧文件夹。
-- `recent`：最近访问。
-- `favorites`：今日收藏。
-- `systems`：飞牛 OS、PVE、容器状态展示。
+多架构：
 
-每个书签支持 `logoUrl` 字段。建议优先填写官方 favicon 或官方 Logo 图片地址；如果不填，添加网址流程会按目标站点自动尝试提取。
+```bash
+docker buildx build \
+  --platform linux/amd64,linux/arm64 \
+  -t yourname/hometab-pilot:latest \
+  --push .
+```
 
-页面右下“设置”可以直接编辑运行时 JSON 配置。Docker 部署时配置会保存到 `hometab-data` 数据卷，不会覆盖镜像内的默认 `config.json`。
+## 安全注意事项
 
-书签卡片支持：
+- 不要把 `.env` 上传到 GitHub。
+- 不要把真实密码写入 `public/config.json`。
+- 不建议把服务直接暴露到公网。
+- 建议通过 VPN、内网穿透鉴权层、反向代理认证或 Tailscale 访问。
+- PVE 推荐使用 API Token，并限制权限。
+- 飞牛 OS SSH 用户建议使用最小权限账号。
+- 容器停止、重启、PVE 强停属于危险操作，请确认目标后再执行。
 
-- 左键：打开网址。
-- 右键：编辑名称、地址、分类和 Logo。
-- 悬停按钮：编辑或删除自定义书签。
+## 故障排查
 
-页面右下“导入书签”支持粘贴 JSON 数组，或每行一个 `名称 URL`。
+### 页面打不开
 
-## 备份与恢复
+```bash
+docker ps
+docker logs hometab-pilot
+curl http://127.0.0.1:8088/api/health
+```
 
-页面右下“备份”支持：
+### 飞牛 OS 无法连接
 
-- 导出：下载包含配置和自定义书签的 JSON 文件。
-- 导入：恢复导出的 JSON 文件，部署模式会写入数据卷，静态预览模式会写入浏览器本地存储。
+- 检查 `FNOS_URL` 是否能从部署机器访问。
+- 检查 SSH 地址、端口、用户名、密码。
+- 检查该用户是否能执行 `docker ps`。
 
-## Logo 提取策略
+### PVE 无法连接
 
-静态部署环境无法稳定跨域读取网站 HTML，所以自动提取使用浏览器可直接加载的图片候选：
+- 检查 `PVE_URL` 是否包含 `https://` 和 `:8006`。
+- 自签证书环境可设置 `PVE_TLS_VERIFY=false`。
+- 检查账号密码或 API Token 权限。
 
-- 书签配置里的 `logoUrl`
-- 目标站点 `/favicon.ico`
-- 目标站点 `/apple-touch-icon.png`
-- Google S2 favicon 服务
-- DuckDuckGo icon 服务
+### Docker Hub Actions 发布失败
 
-常见品牌图标使用 `simple-icons` 内置 SVG，以减少外链失败和图标变形。
+- 检查 GitHub secrets 是否存在。
+- Docker Hub Token 需要有写入权限。
+- 镜像名默认为 `DOCKERHUB_USERNAME/hometab-pilot`。
 
-## 后续接入建议
+## 许可证
 
-- 飞牛 OS：后端读取系统状态、存储池、应用和 Docker 状态。
-- PVE：使用 Proxmox VE API Token 读取节点、VM、LXC、备份任务。
-- Docker：通过飞牛 OS SSH 执行容器列表、日志、重启、停止等操作。
-- 安全：管理动作需要登录、权限分级和二次确认；Token 不进入前端静态文件。
+如果你要公开分发，建议在仓库中补充明确的开源许可证，例如 MIT。
