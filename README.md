@@ -77,7 +77,7 @@ docker run -d \
   -p 8088:8080 \
   -v hometab-data:/data \
   --env-file .env \
-  xiaoguiwucan/hometab-pilot:latest
+  xiaoguiwucan0426/hometab-pilot:latest
 ```
 
 访问：
@@ -137,7 +137,7 @@ PVE 可以二选一：
 ```yaml
 services:
   hometab:
-    image: xiaoguiwucan/hometab-pilot:latest
+    image: xiaoguiwucan0426/hometab-pilot:latest
     container_name: hometab-pilot
     restart: unless-stopped
     env_file:
@@ -267,7 +267,7 @@ git push -u origin main
 ```bash
 docker buildx build \
   --platform linux/amd64,linux/arm64 \
-  -t xiaoguiwucan/hometab-pilot:latest \
+  -t xiaoguiwucan0426/hometab-pilot:latest \
   --push .
 ```
 
