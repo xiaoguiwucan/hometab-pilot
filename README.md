@@ -2,8 +2,8 @@
 
 HomeTab Pilot 是一个面向 NAS、Homelab 和个人服务器场景的自托管导航页。它不只是书签墙，还把飞牛 OS、PVE、Docker 容器状态、日志、资源占用和常用管理操作整合到同一个首页里，适合放在浏览器新标签页、NAS 首页、软路由首页或家庭服务器入口。
 
-当前版本：`v0.3.0`
-更新记录：[CHANGELOG.md](CHANGELOG.md) · GitHub Releases：[v0.3.0](https://github.com/xiaoguiwucan/hometab-pilot/releases/tag/v0.3.0)
+当前版本：`v0.4.0`
+更新记录：[CHANGELOG.md](CHANGELOG.md) · GitHub Releases：[v0.4.0](https://github.com/xiaoguiwucan/hometab-pilot/releases/tag/v0.4.0)
 
 ## 效果预览
 
@@ -30,8 +30,10 @@ HomeTab Pilot 是一个面向 NAS、Homelab 和个人服务器场景的自托管
 - 版本化发布：GitHub Releases 和 Docker Hub 镜像标签按版本区分，支持 `latest` 与固定版本回滚。
 - 登录鉴权：首次配置向导设置管理密码，Docker/PVE 危险操作需要解锁。
 - 通知告警：支持 Bark、Telegram、企业微信机器人、Server 酱和通用 Webhook，并提供页面化配置和测试发送。
-- 容器更新中心：支持检查、拉取镜像、重建容器，并在操作前保存配置备份。
-- 审计导出：服务端记录 Docker/PVE/Auth/通知操作，可导出 JSON 审计日志。
+- 操作安全：危险操作加入冷却时间、撤销窗口和操作前摘要，批量更新需要再次输入管理密码。
+- 容器更新中心：支持 digest 对比、更新标记、一键安全更新和不可复原风险提示。
+- 备份中心：支持版本、备注、来源、自动定时备份、备份对比和全部备份压缩包导出。
+- 审计导出：服务端记录 Docker/PVE/Auth/通知操作，可在前端筛选，并导出 JSON/CSV。
 - 真实设备面板：通过飞牛 OS SSH、PVE API 拉取实时状态，不是静态演示数据。
 - Docker 容器管理：展示容器运行状态、CPU、内存、网络、端口访问地址、日志和配置，并支持重启、停止等操作。
 - Web 容器同步：一键发现飞牛 OS Docker 中可访问的 Web 容器，并同步到 `NAS` 书签分组。
@@ -121,7 +123,7 @@ docker run -d \
   -p 8088:8080 \
   -v hometab-data:/data \
   --env-file .env \
-  xiaoguiwucan0426/hometab-pilot:0.3.0
+  xiaoguiwucan0426/hometab-pilot:0.4.0
 ```
 
 访问：
@@ -175,6 +177,8 @@ cp .env.example .env
 | `TELEGRAM_CHAT_ID` | Telegram Chat ID | `-100xxxx` |
 | `WECOM_WEBHOOK_URL` | 企业微信机器人 Webhook | 留在 `.env` 中 |
 | `NOTIFY_WEBHOOK_URL` | 通用 Webhook | `https://example.com/hook` |
+| `NOTIFY_QUIET_MINUTES` | 同类告警静默分钟数 | `15` |
+| `NOTIFY_DAILY_SUMMARY_HOUR` | 每日摘要发送小时 | `9` |
 
 PVE 可以二选一：
 
@@ -212,6 +216,22 @@ build:
   dockerfile: Dockerfile
 image: hometab-pilot:latest
 ```
+
+## 从旧版本升级
+
+### 从 v0.2.0 升级
+
+1. 先导出页面备份，或备份 `/data` 数据卷。
+2. 更新镜像标签到 `xiaoguiwucan0426/hometab-pilot:0.4.0`。
+3. 启动后进入页面完成首次管理密码设置。
+4. 在设置页重新确认 FNOS / PVE / 通知配置。
+
+### 从 v0.3.0 升级
+
+1. 保留原有 `/data` 数据卷即可继承书签、连接、登录和通知配置。
+2. 更新镜像标签到 `0.4.0` 并重启。
+3. 打开备份中心，按需启用自动定时备份。
+4. 打开容器更新中心，先执行“检查全部更新”，确认安全标记后再批量更新。
 
 ## 飞牛 OS 接入步骤
 
@@ -307,7 +327,7 @@ docker compose up -d
 推荐生产部署使用固定版本标签，方便回滚：
 
 ```bash
-docker pull xiaoguiwucan0426/hometab-pilot:0.3.0
+docker pull xiaoguiwucan0426/hometab-pilot:0.4.0
 docker pull xiaoguiwucan0426/hometab-pilot:latest
 ```
 
@@ -367,6 +387,20 @@ docker logs hometab-pilot
 curl http://127.0.0.1:8088/api/health
 ```
 
+健康检查正常时会返回：
+
+```json
+{"ok":true}
+```
+
+运行时诊断：
+
+```bash
+curl http://127.0.0.1:8088/api/runtime
+```
+
+如果容器刚重启，浏览器里短时间出现 `ERR_CONNECTION_RESET` 属于启动窗口，等待健康状态为 `healthy` 后刷新即可。
+
 ### 飞牛 OS 无法连接
 
 - 检查 `FNOS_URL` 是否能从部署机器访问。
@@ -384,6 +418,12 @@ curl http://127.0.0.1:8088/api/health
 - 检查 GitHub secrets 是否存在。
 - Docker Hub Token 需要有写入权限。
 - 镜像名默认为 `DOCKERHUB_USERNAME/hometab-pilot`。
+
+### 容器无法安全重建
+
+- 更新中心会检查 `devices`、`cap_add`、`host network`、`privileged` 等配置。
+- 存在风险时不会进入“一键安全更新”列表。
+- 这类容器建议先手动备份 compose 或原始运行命令，再单独更新。
 
 ## 许可证
 

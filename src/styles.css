@@ -1554,7 +1554,7 @@ button.bookmark-card {
 .dialog-actions,
 .backup-actions {
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
   gap: 12px;
 }
 
@@ -2577,6 +2577,18 @@ button.bookmark-card {
   cursor: not-allowed;
 }
 
+.audit-table {
+  display: grid;
+  gap: 7px;
+  max-height: 220px;
+  overflow: auto;
+  border: 1px solid var(--work-line);
+  border-radius: 8px;
+  background: var(--surface-soft);
+  padding: 8px;
+  margin-bottom: 12px;
+}
+
 .events-list {
   display: grid;
   gap: 8px;
@@ -2954,7 +2966,7 @@ button.bookmark-card {
 
 .docker-tools {
   display: grid;
-  grid-template-columns: auto minmax(0, 1fr);
+  grid-template-columns: repeat(3, auto) minmax(0, 1fr);
   align-items: center;
   gap: 10px;
   min-width: 0;
@@ -2965,6 +2977,46 @@ button.bookmark-card {
   padding: 8px 10px;
   font-size: 11px;
   font-weight: 740;
+}
+
+.ops-filterbar {
+  display: grid;
+  grid-template-columns: minmax(160px, 1fr) repeat(4, auto);
+  align-items: center;
+  gap: 8px;
+}
+
+.ops-filterbar input {
+  min-width: 0;
+  height: 32px;
+  border: 1px solid var(--work-line);
+  border-radius: 8px;
+  background: var(--surface-solid);
+  color: var(--text);
+  padding: 0 10px;
+  font-size: 12px;
+  font-weight: 760;
+}
+
+.ops-filterbar button {
+  min-height: 32px;
+  border: 1px solid var(--work-line);
+  border-radius: 8px;
+  background: var(--surface-soft);
+  color: var(--subtle);
+  padding: 0 10px;
+  font-size: 11px;
+  font-weight: 840;
+}
+
+.ops-filterbar button.is-active {
+  background: var(--text);
+  color: var(--surface-solid);
+}
+
+.health-chip--update {
+  background: color-mix(in srgb, var(--accent-warm) 16%, transparent);
+  color: var(--accent-warm);
 }
 
 .docker-tools button {
@@ -3561,6 +3613,55 @@ button.container-table__row {
   color: var(--subtle);
   font-size: 11px;
   font-weight: 760;
+}
+
+.update-digest-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px;
+}
+
+.update-digest-grid span,
+.undo-window {
+  min-width: 0;
+  border: 1px solid var(--work-line);
+  border-radius: 8px;
+  background: var(--surface-solid);
+  padding: 7px 8px;
+}
+
+.update-digest-grid b {
+  display: block;
+  margin-bottom: 3px;
+}
+
+.update-digest-grid em {
+  display: block;
+  overflow: hidden;
+  color: var(--subtle);
+  font-style: normal;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.undo-window {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  color: var(--accent-warm);
+  font-size: 11px;
+  font-weight: 820;
+}
+
+.undo-window button {
+  min-height: 28px;
+  border: 0;
+  border-radius: 7px;
+  background: var(--accent-warm);
+  color: #fff;
+  padding: 0 10px;
+  font-weight: 860;
 }
 
 .action-message {
@@ -4629,6 +4730,12 @@ body:has(.app-shell--hud) {
 
   .resource-meter--memory {
     display: none;
+  }
+
+  .docker-tools,
+  .ops-filterbar,
+  .update-digest-grid {
+    grid-template-columns: 1fr;
   }
 
   .notification-status-grid {

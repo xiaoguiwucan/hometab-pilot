@@ -2,6 +2,7 @@ import express from "express";
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
+import zlib from "node:zlib";
 import { fileURLToPath } from "node:url";
 import { Client as SshClient } from "ssh2";
 
@@ -17,10 +18,15 @@ const connectionsPath = path.join(dataDir, "connections.json");
 const authPath = path.join(dataDir, "auth.json");
 const sessionsPath = path.join(dataDir, "sessions.json");
 const notificationPath = path.join(dataDir, "notifications.json");
+const notificationHistoryPath = path.join(dataDir, "notification-history.json");
 const auditPath = path.join(dataDir, "audit-log.json");
 const containerBackupDir = path.join(dataDir, "container-backups");
 const backupDir = path.join(dataDir, "backups");
+const backupSettingsPath = path.join(dataDir, "backup-settings.json");
 const port = Number(process.env.PORT || 8080);
+const appVersion = "0.4.0";
+const operationCooldowns = new Map();
+const undoWindows = new Map();
 
 const app = express();
 app.use(express.json({ limit: "1mb" }));
@@ -163,16 +169,56 @@ async function requireAuth(request, response) {
   return false;
 }
 
+async function requirePassword(request, response) {
+  if (!(await requireAuth(request, response))) return false;
+  const auth = await getAuthConfig();
+  if (!auth.hash || !auth.salt) return true;
+  if (verifyPassword(request.body?.password || "", auth)) return true;
+  await appendAudit({ actor: request.ip, action: "auth.password.required.failed", target: "auth", detail: "二次密码校验失败", severity: "warn", result: "failed" });
+  response.status(403).json({ error: "Password confirmation required" });
+  return false;
+}
+
 async function appendAudit(entry) {
   const current = await readJson(auditPath, []);
   const next = [{
     id: `${Date.now()}-${crypto.randomBytes(4).toString("hex")}`,
     ts: Date.now(),
     at: nowIso(),
+    actor: entry.actor || "system",
+    result: entry.result || "success",
     ...entry
   }, ...current].slice(0, 300);
   await writeJson(auditPath, next);
   return next[0];
+}
+
+function csvEscape(value) {
+  return `"${String(value ?? "").replace(/"/g, '""')}"`;
+}
+
+function auditEventsToCsv(events) {
+  const headers = ["at", "actor", "source", "action", "target", "severity", "result", "detail", "error"];
+  const rows = events.map((event) => headers.map((key) => csvEscape(event[key])).join(","));
+  return [headers.join(","), ...rows].join("\n");
+}
+
+function cooldownKey(scope, id, action) {
+  return `${scope}:${id}:${action}`;
+}
+
+function checkCooldown(scope, id, action, seconds = 30) {
+  const key = cooldownKey(scope, id, action);
+  const until = operationCooldowns.get(key) || 0;
+  if (until > Date.now()) {
+    return { ok: false, retryAfter: Math.ceil((until - Date.now()) / 1000), until: new Date(until).toISOString() };
+  }
+  operationCooldowns.set(key, Date.now() + seconds * 1000);
+  return { ok: true, retryAfter: 0, until: new Date(Date.now() + seconds * 1000).toISOString() };
+}
+
+function undoToken() {
+  return crypto.randomBytes(18).toString("hex");
 }
 
 async function getNotificationSettings() {
@@ -184,7 +230,11 @@ async function getNotificationSettings() {
     telegramBotToken: stored.telegramBotToken || process.env.TELEGRAM_BOT_TOKEN || "",
     telegramChatId: stored.telegramChatId || process.env.TELEGRAM_CHAT_ID || "",
     webhookUrl: stored.webhookUrl || process.env.NOTIFY_WEBHOOK_URL || "",
-    wecomWebhookUrl: stored.wecomWebhookUrl || process.env.WECOM_WEBHOOK_URL || ""
+    wecomWebhookUrl: stored.wecomWebhookUrl || process.env.WECOM_WEBHOOK_URL || "",
+    quietMinutes: Number(stored.quietMinutes ?? process.env.NOTIFY_QUIET_MINUTES ?? 15),
+    dailySummaryEnabled: Boolean(stored.dailySummaryEnabled ?? false),
+    dailySummaryHour: Number(stored.dailySummaryHour ?? process.env.NOTIFY_DAILY_SUMMARY_HOUR ?? 9),
+    lastDailySummaryDate: stored.lastDailySummaryDate || ""
   };
 }
 
@@ -195,13 +245,29 @@ function publicNotificationSettings(settings) {
     serverChanConfigured: Boolean(settings.serverChanKey),
     telegramConfigured: Boolean(settings.telegramBotToken && settings.telegramChatId),
     webhookConfigured: Boolean(settings.webhookUrl),
-    wecomConfigured: Boolean(settings.wecomWebhookUrl)
+    wecomConfigured: Boolean(settings.wecomWebhookUrl),
+    quietMinutes: Number(settings.quietMinutes || 0),
+    dailySummaryEnabled: Boolean(settings.dailySummaryEnabled),
+    dailySummaryHour: Number(settings.dailySummaryHour || 9),
+    lastDailySummaryDate: settings.lastDailySummaryDate || ""
   };
 }
 
-async function sendNotification(title, message, severity = "info") {
+async function shouldSendNotification(key, quietMinutes) {
+  if (!key || !quietMinutes) return true;
+  const history = await readJson(notificationHistoryPath, {});
+  const last = new Date(history[key] || 0).getTime();
+  if (last && Date.now() - last < quietMinutes * 60 * 1000) return false;
+  await writeJson(notificationHistoryPath, { ...history, [key]: nowIso() });
+  return true;
+}
+
+async function sendNotification(title, message, severity = "info", key = "") {
   const settings = await getNotificationSettings();
   if (!settings.enabled) return { ok: false, skipped: "disabled" };
+  if (!(await shouldSendNotification(key || `${severity}:${title}`, settings.quietMinutes))) {
+    return { ok: false, skipped: "quiet-window" };
+  }
   const tasks = [];
   if (settings.barkUrl) {
     const url = `${String(settings.barkUrl).replace(/\/$/, "")}/${encodeURIComponent(title)}/${encodeURIComponent(message)}?group=HomeTab&level=${severity === "critical" ? "critical" : "active"}`;
@@ -241,20 +307,53 @@ async function sendNotification(title, message, severity = "info") {
     }).then((res) => ({ channel: "wecom", ok: res.ok, status: res.status })));
   }
   const results = await Promise.allSettled(tasks);
-  return { ok: results.some((item) => item.status === "fulfilled" && item.value.ok), results };
+  const normalized = results.map((item) => item.status === "fulfilled" ? item.value : { channel: "unknown", ok: false, error: item.reason?.message || String(item.reason) });
+  return { ok: normalized.some((item) => item.ok), results: normalized };
+}
+
+async function maybeSendDailySummary(status) {
+  const settings = await getNotificationSettings();
+  if (!settings.enabled || !settings.dailySummaryEnabled) return;
+  const now = new Date();
+  const today = now.toISOString().slice(0, 10);
+  if (settings.lastDailySummaryDate === today || now.getHours() < settings.dailySummaryHour) return;
+  const docker = status.docker || {};
+  const pve = status.pve || {};
+  const fnos = status.fnos || {};
+  const message = [
+    `FNOS：${fnos.available ? "在线" : "异常"} CPU ${fnos.cpu ?? "-"}% / 内存 ${fnos.memory ?? "-"}%`,
+    `Docker：${docker.running ?? 0}/${docker.total ?? 0} 个容器运行`,
+    `PVE：${pve.available ? `${pve.node || "node"} 在线` : "异常"}，${pve.vms?.length || 0} 台 VM/LXC`
+  ].join("\n");
+  await sendNotification("HomeTab Pilot 每日摘要", message, "info", `daily-summary:${today}`);
+  const current = await getNotificationSettings();
+  await writeJson(notificationPath, { ...current, lastDailySummaryDate: today });
 }
 
 async function buildBackupPayload() {
   const [config, customBookmarks] = await Promise.all([getConfig(), getBookmarks()]);
   return {
-    version: 1,
+    version: appVersion,
     exportedAt: new Date().toISOString(),
+    source: "manual",
     config,
     customBookmarks
   };
 }
 
-async function pruneBackups(keep = 7) {
+async function getBackupSettings() {
+  const stored = await readJson(backupSettingsPath, {});
+  return {
+    enabled: Boolean(stored.enabled),
+    intervalHours: Math.max(1, Math.min(Number(stored.intervalHours || 24), 168)),
+    keep: Math.max(3, Math.min(Number(stored.keep || 14), 60)),
+    lastRunAt: stored.lastRunAt || "",
+    note: stored.note || ""
+  };
+}
+
+async function pruneBackups(keep) {
+  const settings = keep ? { keep } : await getBackupSettings();
   try {
     const entries = await fs.readdir(backupDir, { withFileTypes: true });
     const files = await Promise.all(
@@ -269,7 +368,7 @@ async function pruneBackups(keep = 7) {
     await Promise.all(
       files
         .sort((a, b) => b.mtimeMs - a.mtimeMs)
-        .slice(keep)
+        .slice(settings.keep)
         .map((file) => fs.rm(path.join(backupDir, file.name), { force: true }))
     );
   } catch {
@@ -277,12 +376,16 @@ async function pruneBackups(keep = 7) {
   }
 }
 
-async function createBackupSnapshot(payload) {
+async function createBackupSnapshot(payload, meta = {}) {
   await fs.mkdir(backupDir, { recursive: true });
   const backup = payload || (await buildBackupPayload());
+  backup.version = backup.version || appVersion;
+  backup.source = meta.source || backup.source || "manual";
+  backup.note = meta.note ?? backup.note ?? "";
+  backup.createdBy = meta.createdBy || backup.createdBy || "system";
   const name = backupFileName(new Date(backup.exportedAt || Date.now()));
   await writeJson(path.join(backupDir, name), backup);
-  await pruneBackups(7);
+  await pruneBackups();
   return { name, ...summarizeBackup(name, backup) };
 }
 
@@ -290,6 +393,9 @@ function summarizeBackup(name, payload) {
   return {
     name,
     exportedAt: payload.exportedAt,
+    version: payload.version || 1,
+    source: payload.source || "manual",
+    note: payload.note || "",
     configBookmarks: Array.isArray(payload.config?.bookmarks) ? payload.config.bookmarks.length : 0,
     customBookmarks: Array.isArray(payload.customBookmarks) ? payload.customBookmarks.length : 0,
     categories: Array.isArray(payload.config?.categories) ? payload.config.categories.length : 0
@@ -308,10 +414,48 @@ async function listBackupSnapshots() {
           return { ...summarizeBackup(entry.name, payload), size: stat.size, mtimeMs: stat.mtimeMs };
         })
     );
-    return backups.sort((a, b) => b.mtimeMs - a.mtimeMs).slice(0, 7);
+    return backups.sort((a, b) => b.mtimeMs - a.mtimeMs);
   } catch {
     return [];
   }
+}
+
+function backupDiff(current, candidate) {
+  const currentBookmarks = new Set([...(current.config?.bookmarks || []), ...(current.customBookmarks || [])].map((item) => normalizeUrl(item.url)));
+  const candidateBookmarks = new Set([...(candidate.config?.bookmarks || []), ...(candidate.customBookmarks || [])].map((item) => normalizeUrl(item.url)));
+  const added = [...candidateBookmarks].filter((url) => !currentBookmarks.has(url));
+  const removed = [...currentBookmarks].filter((url) => !candidateBookmarks.has(url));
+  const categoryChanges = {
+    current: current.config?.categories || [],
+    backup: candidate.config?.categories || []
+  };
+  return {
+    addedBookmarks: added,
+    removedBookmarks: removed,
+    currentCount: currentBookmarks.size,
+    backupCount: candidateBookmarks.size,
+    categoryChanges
+  };
+}
+
+async function createBackupArchive() {
+  const backups = await listBackupSnapshots();
+  const payloads = await Promise.all(backups.map(async (backup) => ({
+    summary: backup,
+    payload: await readJson(path.join(backupDir, backup.name), {})
+  })));
+  const bundle = { version: appVersion, exportedAt: nowIso(), backups: payloads };
+  return zlib.gzipSync(Buffer.from(JSON.stringify(bundle, null, 2)));
+}
+
+async function maybeRunScheduledBackup() {
+  const settings = await getBackupSettings();
+  if (!settings.enabled) return null;
+  const last = settings.lastRunAt ? new Date(settings.lastRunAt).getTime() : 0;
+  if (last && Date.now() - last < settings.intervalHours * 60 * 60 * 1000) return null;
+  const backup = await createBackupSnapshot({ ...(await buildBackupPayload()), exportedAt: nowIso() }, { source: "scheduled", note: settings.note, createdBy: "scheduler" });
+  await writeJson(backupSettingsPath, { ...settings, lastRunAt: nowIso() });
+  return backup;
 }
 
 async function getConnections() {
@@ -885,6 +1029,77 @@ function dockerRunArgsFromInspect(inspect) {
   return args.join(" ");
 }
 
+function dockerRecreateSafety(inspect) {
+  const hostConfig = inspect.HostConfig || {};
+  const config = inspect.Config || {};
+  const networkMode = String(hostConfig.NetworkMode || "");
+  const risks = [];
+  if (hostConfig.Privileged) risks.push("privileged");
+  if ((hostConfig.Devices || []).length) risks.push("devices");
+  if ((hostConfig.CapAdd || []).length) risks.push("cap_add");
+  if ((hostConfig.Binds || []).some((bind) => String(bind).includes(":shared") || String(bind).includes(":rshared"))) risks.push("shared_mount");
+  if (networkMode === "host" || networkMode === "container") risks.push(`${networkMode}_network`);
+  if (hostConfig.IpcMode && hostConfig.IpcMode !== "private") risks.push("ipc_mode");
+  if (hostConfig.PidMode) risks.push("pid_mode");
+  if (config.Entrypoint && Array.isArray(config.Entrypoint) && config.Entrypoint.length) risks.push("entrypoint");
+  return {
+    safe: risks.length === 0,
+    risks,
+    summary: {
+      name: safeContainerName(inspect.Name),
+      image: config.Image || inspect.Image || "",
+      imageId: inspect.Image || "",
+      command: [inspect.Path, ...(inspect.Args || [])].filter(Boolean).join(" "),
+      mounts: (inspect.Mounts || []).map((mount) => ({ type: mount.Type, source: mount.Source, destination: mount.Destination, mode: mount.Mode })),
+      ports: inspect.NetworkSettings?.Ports || {},
+      env: redactEnv(config.Env || []),
+      restartPolicy: hostConfig.RestartPolicy?.Name || "",
+      networkMode,
+      runCommand: dockerRunArgsFromInspect(inspect)
+    }
+  };
+}
+
+async function inspectContainer(id) {
+  const inspectOutput = await runFnosDocker(`inspect ${shellQuote(id)}`);
+  return JSON.parse(inspectOutput)[0];
+}
+
+function digestFromRepoDigests(repoDigests = []) {
+  const value = Array.isArray(repoDigests) ? repoDigests[0] : "";
+  return String(value || "").includes("@") ? String(value).split("@").pop() : "";
+}
+
+async function dockerImageDigestReport(image) {
+  const localRaw = image ? await runFnosDocker(`image inspect ${shellQuote(image)} --format '{{json .}}'`).catch(() => "") : "";
+  const local = localRaw ? JSON.parse(localRaw) : {};
+  const manifestRaw = image ? await runFnosDocker(`manifest inspect ${shellQuote(image)}`).catch(() => "") : "";
+  const manifest = manifestRaw ? JSON.parse(manifestRaw) : {};
+  const localDigest = digestFromRepoDigests(local.RepoDigests) || local.Id || "";
+  const remoteDigest = manifest?.Descriptor?.digest || manifest?.digest || manifest?.config?.digest || "";
+  return {
+    localDigest,
+    remoteDigest,
+    hasUpdate: Boolean(localDigest && remoteDigest && localDigest !== remoteDigest),
+    repoDigests: local.RepoDigests || []
+  };
+}
+
+async function containerUpdateReport(id) {
+  const inspect = await inspectContainer(id);
+  const detail = dockerRecreateSafety(inspect);
+  const image = inspect.Config?.Image || "";
+  const digest = await dockerImageDigestReport(image);
+  return {
+    ok: true,
+    id,
+    image,
+    ...digest,
+    safety: detail,
+    backups: await listContainerBackups(safeContainerName(inspect.Name || id))
+  };
+}
+
 async function listContainerBackups(id = "") {
   try {
     const entries = await fs.readdir(containerBackupDir, { withFileTypes: true });
@@ -951,6 +1166,7 @@ function buildDiagnostics(status) {
 }
 
 app.get("/api/runtime", async (_request, response) => {
+  await maybeRunScheduledBackup();
   const config = await getConfig();
   const [customBookmarks, dockerStatus, pveStatus, fnosStatus] = await Promise.all([
     getBookmarks(),
@@ -964,6 +1180,7 @@ app.get("/api/runtime", async (_request, response) => {
     pve: pveStatus,
     fnos: fnosStatus
   };
+  void maybeSendDailySummary(status).catch(() => undefined);
 
   response.json({
     config,
@@ -1029,6 +1246,11 @@ app.get("/api/audit/export", async (request, response) => {
   response.type("application/json").send(JSON.stringify(await readJson(auditPath, []), null, 2));
 });
 
+app.get("/api/audit/export.csv", async (request, response) => {
+  if (!(await requireAuth(request, response))) return;
+  response.type("text/csv").send(auditEventsToCsv(await readJson(auditPath, [])));
+});
+
 app.get("/api/notifications", async (request, response) => {
   if (!(await requireAuth(request, response))) return;
   response.json(publicNotificationSettings(await getNotificationSettings()));
@@ -1044,7 +1266,11 @@ app.put("/api/notifications", async (request, response) => {
     telegramBotToken: request.body?.telegramBotToken ? String(request.body.telegramBotToken) : current.telegramBotToken,
     telegramChatId: request.body?.telegramChatId ? String(request.body.telegramChatId) : current.telegramChatId,
     webhookUrl: request.body?.webhookUrl ? String(request.body.webhookUrl) : current.webhookUrl,
-    wecomWebhookUrl: request.body?.wecomWebhookUrl ? String(request.body.wecomWebhookUrl) : current.wecomWebhookUrl
+    wecomWebhookUrl: request.body?.wecomWebhookUrl ? String(request.body.wecomWebhookUrl) : current.wecomWebhookUrl,
+    quietMinutes: Math.max(0, Math.min(Number(request.body?.quietMinutes ?? current.quietMinutes ?? 15), 1440)),
+    dailySummaryEnabled: Boolean(request.body?.dailySummaryEnabled),
+    dailySummaryHour: Math.max(0, Math.min(Number(request.body?.dailySummaryHour ?? current.dailySummaryHour ?? 9), 23)),
+    lastDailySummaryDate: current.lastDailySummaryDate || ""
   };
   await writeJson(notificationPath, next);
   await appendAudit({ actor: "admin", action: "notifications.update", target: "notifications", detail: "通知配置已更新", severity: "info" });
@@ -1053,7 +1279,7 @@ app.put("/api/notifications", async (request, response) => {
 
 app.post("/api/notifications/test", async (request, response) => {
   if (!(await requireAuth(request, response))) return;
-  const result = await sendNotification("HomeTab Pilot 测试通知", "通知通道已连通。", "info");
+  const result = await sendNotification("HomeTab Pilot 测试通知", "通知通道已连通。", "info", `test:${Date.now()}`);
   response.json(result);
 });
 
@@ -1061,8 +1287,27 @@ app.post("/api/notifications/event", async (request, response) => {
   const title = String(request.body?.title || "HomeTab Pilot 告警");
   const message = String(request.body?.message || request.body?.detail || "");
   const severity = String(request.body?.severity || "warn");
-  const result = await sendNotification(title, message, severity);
+  const key = String(request.body?.key || `${severity}:${title}:${message}`);
+  const result = await sendNotification(title, message, severity, key);
   response.json(result);
+});
+
+app.post("/api/notifications/daily-summary", async (request, response) => {
+  if (!(await requireAuth(request, response))) return;
+  const status = {
+    docker: await getDockerStatus(),
+    pve: await getPveStatus(),
+    fnos: await getFnosStatus(await getConfig())
+  };
+  const docker = status.docker || {};
+  const pve = status.pve || {};
+  const fnos = status.fnos || {};
+  const message = [
+    `FNOS：${fnos.available ? "在线" : "异常"} CPU ${fnos.cpu ?? "-"}% / 内存 ${fnos.memory ?? "-"}%`,
+    `Docker：${docker.running ?? 0}/${docker.total ?? 0} 个容器运行`,
+    `PVE：${pve.available ? `${pve.node || "node"} 在线` : "异常"}，${pve.vms?.length || 0} 台 VM/LXC`
+  ].join("\n");
+  response.json(await sendNotification("HomeTab Pilot 每日摘要", message, "info", `manual-daily:${Date.now()}`));
 });
 
 app.get("/api/bookmarks", async (_request, response) => {
@@ -1230,7 +1475,7 @@ app.post("/api/config/reset", async (_request, response) => {
 
 app.get("/api/backup", async (_request, response) => {
   const backup = await buildBackupPayload();
-  await createBackupSnapshot(backup);
+  await createBackupSnapshot(backup, { source: "manual", note: "导出备份" });
   response.json(backup);
 });
 
@@ -1246,8 +1491,10 @@ app.post("/api/backup", async (request, response) => {
   const nextBookmarks = customBookmarks.slice(0, 80);
   await Promise.all([writeJson(runtimeConfigPath, config), writeJson(bookmarksPath, nextBookmarks)]);
   await createBackupSnapshot({
-    version: request.body?.version || 1,
+    version: request.body?.version || appVersion,
     exportedAt: new Date().toISOString(),
+    source: request.body?.source || "import",
+    note: request.body?.note || "导入恢复",
     config,
     customBookmarks: nextBookmarks
   });
@@ -1258,8 +1505,32 @@ app.get("/api/backups", async (_request, response) => {
   response.json({ backups: await listBackupSnapshots() });
 });
 
-app.post("/api/backups", async (_request, response) => {
-  response.json({ ok: true, backup: await createBackupSnapshot() });
+app.post("/api/backups", async (request, response) => {
+  response.json({ ok: true, backup: await createBackupSnapshot(await buildBackupPayload(), { source: request.body?.source || "manual", note: request.body?.note || "", createdBy: "user" }) });
+});
+
+app.get("/api/backups/settings", async (_request, response) => {
+  response.json(await getBackupSettings());
+});
+
+app.put("/api/backups/settings", async (request, response) => {
+  const current = await getBackupSettings();
+  const next = {
+    ...current,
+    enabled: Boolean(request.body?.enabled),
+    intervalHours: Math.max(1, Math.min(Number(request.body?.intervalHours || current.intervalHours), 168)),
+    keep: Math.max(3, Math.min(Number(request.body?.keep || current.keep), 60)),
+    note: String(request.body?.note || current.note || "")
+  };
+  await writeJson(backupSettingsPath, next);
+  response.json(next);
+});
+
+app.get("/api/backups/archive", async (_request, response) => {
+  const archive = await createBackupArchive();
+  response.setHeader("Content-Type", "application/gzip");
+  response.setHeader("Content-Disposition", `attachment; filename="hometab-backups-${new Date().toISOString().slice(0, 10)}.json.gz"`);
+  response.send(archive);
 });
 
 app.get("/api/backups/:name", async (request, response) => {
@@ -1277,6 +1548,20 @@ app.get("/api/backups/:name", async (request, response) => {
   response.json(payload);
 });
 
+app.get("/api/backups/:name/compare", async (request, response) => {
+  const name = String(request.params.name || "");
+  if (!isSafeBackupName(name)) {
+    response.status(400).json({ error: "Invalid backup name" });
+    return;
+  }
+  const payload = await readJson(path.join(backupDir, name), null);
+  if (!payload) {
+    response.status(404).json({ error: "Backup not found" });
+    return;
+  }
+  response.json({ backup: summarizeBackup(name, payload), diff: backupDiff(await buildBackupPayload(), payload) });
+});
+
 app.post("/api/backups/:name/restore", async (request, response) => {
   const name = String(request.params.name || "");
   if (!isSafeBackupName(name)) {
@@ -1291,7 +1576,7 @@ app.post("/api/backups/:name/restore", async (request, response) => {
   }
 
   const current = await buildBackupPayload();
-  await createBackupSnapshot({ ...current, exportedAt: new Date().toISOString() });
+  await createBackupSnapshot({ ...current, exportedAt: new Date().toISOString() }, { source: "before-restore", note: `恢复 ${name} 前自动备份` });
   const nextBookmarks = payload.customBookmarks.slice(0, 80);
   await Promise.all([writeJson(runtimeConfigPath, payload.config), writeJson(bookmarksPath, nextBookmarks)]);
   response.json({ ok: true, config: payload.config, customBookmarks: nextBookmarks });
@@ -1369,20 +1654,66 @@ app.get("/api/docker/containers/:id", async (request, response) => {
   }
 });
 
-app.post("/api/docker/containers/:id/:action", async (request, response) => {
-  if (!(await requireAuth(request, response))) return;
+app.post("/api/docker/containers/:id/:action", async (request, response, next) => {
   const allowed = new Set(["start", "stop", "restart"]);
   if (!allowed.has(request.params.action)) {
-    response.status(400).json({ error: "Unsupported action" });
+    next();
     return;
   }
+  if (!(await requireAuth(request, response))) return;
 
   try {
+    const cooldown = checkCooldown("docker", request.params.id, request.params.action);
+    if (!cooldown.ok) {
+      response.status(429).json({ error: "Operation cooling down", ...cooldown });
+      return;
+    }
     await saveContainerBackup(request.params.id, `before-${request.params.action}`);
     await runFnosDocker(`${request.params.action} ${shellQuote(request.params.id)}`);
-    await appendAudit({ actor: request.ip, action: `docker.${request.params.action}`, target: request.params.id, detail: "Docker action executed", severity: "info" });
+    let undo = null;
+    if (request.params.action === "stop") {
+      const token = undoToken();
+      undo = { token, action: "start", expiresAt: new Date(Date.now() + 30_000).toISOString() };
+      undoWindows.set(token, { scope: "docker", id: request.params.id, action: "start", expiresAt: Date.now() + 30_000 });
+    }
+    await appendAudit({ actor: request.ip, action: `docker.${request.params.action}`, target: request.params.id, detail: "Docker action executed", severity: "info", result: "success" });
     await sendNotification(`Docker ${request.params.action}`, `${request.params.id} 操作已执行。`, "info");
+    response.json({ ok: true, cooldown, undo });
+  } catch (error) {
+    await appendAudit({ actor: request.ip, action: `docker.${request.params.action}`, target: request.params.id, detail: "Docker action failed", severity: "warn", result: "failed", error: error.message });
+    response.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/api/docker/undo/:token", async (request, response) => {
+  if (!(await requireAuth(request, response))) return;
+  const undo = undoWindows.get(request.params.token);
+  if (!undo || undo.expiresAt < Date.now()) {
+    response.status(410).json({ error: "Undo window expired" });
+    return;
+  }
+  try {
+    if (undo.action === "rollback" && undo.backup) {
+      const payload = await readJson(path.join(containerBackupDir, undo.backup), null);
+      if (!payload?.inspect) throw new Error("Rollback backup not found");
+      await runFnosDocker(`rm -f ${shellQuote(safeContainerName(payload.inspect.Name))}`);
+      await runFnosDocker(dockerRunArgsFromInspect(payload.inspect));
+    } else {
+      await runFnosDocker(`${undo.action} ${shellQuote(undo.id)}`);
+    }
+    undoWindows.delete(request.params.token);
+    await appendAudit({ actor: request.ip, action: `docker.undo.${undo.action}`, target: undo.id, detail: "撤销窗口内恢复操作", severity: "info", result: "success" });
     response.json({ ok: true });
+  } catch (error) {
+    await appendAudit({ actor: request.ip, action: `docker.undo.${undo.action}`, target: undo.id, detail: "撤销失败", severity: "warn", result: "failed", error: error.message });
+    response.status(500).json({ error: error.message });
+  }
+});
+
+app.get("/api/docker/containers/:id/operation-preview", async (request, response) => {
+  try {
+    const inspect = await inspectContainer(request.params.id);
+    response.json({ ok: true, ...dockerRecreateSafety(inspect) });
   } catch (error) {
     response.status(500).json({ error: error.message });
   }
@@ -1390,10 +1721,27 @@ app.post("/api/docker/containers/:id/:action", async (request, response) => {
 
 app.get("/api/docker/containers/:id/update", async (request, response) => {
   try {
-    const detail = await getDockerContainerDetail(request.params.id);
-    const image = detail.image || "";
-    const local = image ? await runFnosDocker(`image inspect ${shellQuote(image)} --format '{{json .Id}} {{json .RepoDigests}}'`).catch(() => "") : "";
-    response.json({ ok: true, image, local, backups: await listContainerBackups(detail.name || request.params.id) });
+    response.json(await containerUpdateReport(request.params.id));
+  } catch (error) {
+    response.status(500).json({ error: error.message });
+  }
+});
+
+app.get("/api/docker/updates", async (_request, response) => {
+  try {
+    const dockerStatus = await getDockerStatus();
+    if (!dockerStatus.available) {
+      response.status(503).json({ error: dockerStatus.error || "Docker unavailable" });
+      return;
+    }
+    const reports = await Promise.all(dockerStatus.services.map((container) => containerUpdateReport(container.id).catch((error) => ({
+      ok: false,
+      id: container.id,
+      image: container.image,
+      name: container.name,
+      error: error.message
+    }))));
+    response.json({ ok: true, reports });
   } catch (error) {
     response.status(500).json({ error: error.message });
   }
@@ -1402,13 +1750,19 @@ app.get("/api/docker/containers/:id/update", async (request, response) => {
 app.post("/api/docker/containers/:id/pull", async (request, response) => {
   if (!(await requireAuth(request, response))) return;
   try {
+    const cooldown = checkCooldown("docker", request.params.id, "pull", 60);
+    if (!cooldown.ok) {
+      response.status(429).json({ error: "Operation cooling down", ...cooldown });
+      return;
+    }
     const detail = await getDockerContainerDetail(request.params.id);
     await saveContainerBackup(request.params.id, "before-pull");
     const output = await runFnosDocker(`pull ${shellQuote(detail.image)}`);
-    await appendAudit({ actor: request.ip, action: "docker.pull", target: detail.name || request.params.id, detail: detail.image, severity: "info" });
+    await appendAudit({ actor: request.ip, action: "docker.pull", target: detail.name || request.params.id, detail: detail.image, severity: "info", result: "success" });
     await sendNotification("Docker 镜像已拉取", `${detail.name || request.params.id} · ${detail.image}`, "info");
     response.json({ ok: true, image: detail.image, output });
   } catch (error) {
+    await appendAudit({ actor: request.ip, action: "docker.pull", target: request.params.id, detail: "镜像拉取失败", severity: "warn", result: "failed", error: error.message });
     response.status(500).json({ error: error.message });
   }
 });
@@ -1416,16 +1770,59 @@ app.post("/api/docker/containers/:id/pull", async (request, response) => {
 app.post("/api/docker/containers/:id/recreate", async (request, response) => {
   if (!(await requireAuth(request, response))) return;
   try {
+    const cooldown = checkCooldown("docker", request.params.id, "recreate", 60);
+    if (!cooldown.ok) {
+      response.status(429).json({ error: "Operation cooling down", ...cooldown });
+      return;
+    }
     const backup = await saveContainerBackup(request.params.id, "before-recreate");
     const inspect = backup.payload.inspect;
+    const safety = dockerRecreateSafety(inspect);
+    if (!safety.safe && !request.body?.force) {
+      response.status(409).json({ error: "Container has risky options", safety });
+      return;
+    }
     const name = safeContainerName(inspect.Name);
     const runArgs = dockerRunArgsFromInspect(inspect);
     await runFnosDocker(`rm -f ${shellQuote(name)}`);
     const output = await runFnosDocker(runArgs);
-    await appendAudit({ actor: request.ip, action: "docker.recreate", target: name, detail: backup.filename, severity: "warn" });
+    const token = undoToken();
+    undoWindows.set(token, { scope: "docker", id: name, action: "rollback", backup: backup.filename, expiresAt: Date.now() + 60_000 });
+    await appendAudit({ actor: request.ip, action: "docker.recreate", target: name, detail: backup.filename, severity: "warn", result: "success" });
     await sendNotification("Docker 容器已重建", `${name} 已根据备份配置重建。`, "warn");
-    response.json({ ok: true, backup: backup.filename, output });
+    response.json({ ok: true, backup: backup.filename, output, undo: { token, action: "rollback", expiresAt: new Date(Date.now() + 60_000).toISOString() } });
   } catch (error) {
+    await appendAudit({ actor: request.ip, action: "docker.recreate", target: request.params.id, detail: "容器重建失败", severity: "warn", result: "failed", error: error.message });
+    response.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/api/docker/updates/bulk-safe", async (request, response) => {
+  if (!(await requirePassword(request, response))) return;
+  try {
+    const dockerStatus = await getDockerStatus();
+    if (!dockerStatus.available) {
+      response.status(503).json({ error: dockerStatus.error || "Docker unavailable" });
+      return;
+    }
+    const candidates = [];
+    for (const container of dockerStatus.services) {
+      const report = await containerUpdateReport(container.id).catch(() => null);
+      if (report?.hasUpdate && report.safety?.safe) candidates.push({ container, report });
+    }
+    const results = [];
+    for (const item of candidates) {
+      const backup = await saveContainerBackup(item.container.id, "before-bulk-update");
+      const pullOutput = await runFnosDocker(`pull ${shellQuote(item.report.image)}`);
+      const runArgs = dockerRunArgsFromInspect(backup.payload.inspect);
+      await runFnosDocker(`rm -f ${shellQuote(safeContainerName(backup.payload.inspect.Name))}`);
+      const recreateOutput = await runFnosDocker(runArgs);
+      results.push({ name: item.container.name, image: item.report.image, backup: backup.filename, pullOutput, recreateOutput });
+    }
+    await appendAudit({ actor: request.ip, action: "docker.bulk-safe-update", target: "docker", detail: `${results.length} 个容器已安全更新`, severity: results.length ? "warn" : "info", result: "success" });
+    response.json({ ok: true, updated: results.length, results });
+  } catch (error) {
+    await appendAudit({ actor: request.ip, action: "docker.bulk-safe-update", target: "docker", detail: "批量安全更新失败", severity: "warn", result: "failed", error: error.message });
     response.status(500).json({ error: error.message });
   }
 });
@@ -1483,14 +1880,20 @@ app.post("/api/pve/:node/:type/:vmid/:action", async (request, response) => {
   }
 
   try {
+    const cooldown = checkCooldown("pve", `${type}-${vmid}`, action, 30);
+    if (!cooldown.ok) {
+      response.status(429).json({ error: "Operation cooling down", ...cooldown });
+      return;
+    }
     const data = await pveFetch(
       `/nodes/${encodeURIComponent(node)}/${type}/${encodeURIComponent(vmid)}/status/${action}`,
       { method: "POST" }
     );
-    await appendAudit({ actor: request.ip, action: `pve.${action}`, target: `${type}/${vmid}`, detail: node, severity: action === "stop" ? "warn" : "info" });
+    await appendAudit({ actor: request.ip, action: `pve.${action}`, target: `${type}/${vmid}`, detail: node, severity: action === "stop" ? "warn" : "info", result: "success" });
     await sendNotification(`PVE ${action}`, `${type.toUpperCase()} ${vmid} 操作已提交。`, action === "stop" ? "warn" : "info");
-    response.json({ ok: true, data });
+    response.json({ ok: true, data, cooldown });
   } catch (error) {
+    await appendAudit({ actor: request.ip, action: `pve.${action}`, target: `${type}/${vmid}`, detail: node, severity: "warn", result: "failed", error: error.message });
     response.status(500).json({ error: error.message });
   }
 });

@@ -46,6 +46,8 @@ type AppConfig = {
 type BackupPayload = {
   version?: number;
   exportedAt?: string;
+  source?: string;
+  note?: string;
   config?: AppConfig;
   customBookmarks?: Bookmark[];
 };
@@ -53,6 +55,9 @@ type BackupPayload = {
 type BackupSummary = {
   name: string;
   exportedAt?: string;
+  version?: string | number;
+  source?: string;
+  note?: string;
   configBookmarks: number;
   customBookmarks: number;
   categories: number;
@@ -72,6 +77,10 @@ type NotificationPublicSettings = {
   telegramConfigured: boolean;
   webhookConfigured: boolean;
   wecomConfigured: boolean;
+  quietMinutes: number;
+  dailySummaryEnabled: boolean;
+  dailySummaryHour: number;
+  lastDailySummaryDate?: string;
 };
 
 type NotificationSettingsDraft = NotificationPublicSettings & {
@@ -81,6 +90,52 @@ type NotificationSettingsDraft = NotificationPublicSettings & {
   telegramChatId: string;
   webhookUrl: string;
   wecomWebhookUrl: string;
+};
+
+type DockerUpdateReport = {
+  ok: boolean;
+  id: string;
+  image: string;
+  localDigest?: string;
+  remoteDigest?: string;
+  hasUpdate?: boolean;
+  safety?: {
+    safe: boolean;
+    risks: string[];
+    summary: {
+      image: string;
+      imageId?: string;
+      command?: string;
+      mounts?: Array<{ type?: string; source?: string; destination?: string; mode?: string }>;
+      ports?: Record<string, unknown>;
+      env?: string[];
+      restartPolicy?: string;
+      networkMode?: string;
+      runCommand?: string;
+    };
+  };
+  backups?: BackupSummary[];
+  error?: string;
+};
+
+type AuditEvent = {
+  id: string;
+  at: string;
+  actor?: string;
+  action?: string;
+  target?: string;
+  detail?: string;
+  severity?: EventSeverity;
+  result?: "success" | "failed" | string;
+  error?: string;
+};
+
+type BackupSettings = {
+  enabled: boolean;
+  intervalHours: number;
+  keep: number;
+  lastRunAt?: string;
+  note?: string;
 };
 
 type RuntimeStatus = {
@@ -485,6 +540,16 @@ function downloadText(filename: string, value: string) {
   URL.revokeObjectURL(url);
 }
 
+async function downloadResponse(filename: string, response: Response) {
+  const blob = await response.blob();
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = filename;
+  anchor.click();
+  URL.revokeObjectURL(url);
+}
+
 function safeFilename(value: string) {
   return value.replace(/[\\/:*?"<>|\s]+/g, "-").replace(/^-+|-+$/g, "") || "container";
 }
@@ -830,13 +895,13 @@ function useRuntime() {
         )));
         if (!freshEvents.length) return current;
         freshEvents
-          .filter((event) => event.severity === "critical" || event.severity === "warn")
+          .filter((event) => event.severity === "critical" || event.severity === "warn" || event.title.includes("已恢复"))
           .slice(0, 3)
           .forEach((event) => {
             void fetch("/api/notifications/event", {
               method: "POST",
               headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ title: event.title, message: event.detail, severity: event.severity })
+              body: JSON.stringify({ title: event.title, message: event.detail, severity: event.severity, key: `${event.source}:${event.title}` })
             }).catch(() => undefined);
           });
         const merged = [...freshEvents, ...current].slice(0, 80);
@@ -1691,6 +1756,17 @@ function SystemCards({
   const [executingAction, setExecutingAction] = useState("");
   const [syncingWebBookmarks, setSyncingWebBookmarks] = useState(false);
   const [updateMessage, setUpdateMessage] = useState("");
+  const [updateReports, setUpdateReports] = useState<Record<string, DockerUpdateReport>>({});
+  const [undoState, setUndoState] = useState<{ token: string; label: string; expiresAt: string } | null>(null);
+  const [containerSearch, setContainerSearch] = useState("");
+  const [containerStateFilter, setContainerStateFilter] = useState<"all" | "running" | "stopped" | "updates">("all");
+  const [pinnedContainers, setPinnedContainers] = useState<string[]>(() => {
+    try {
+      return JSON.parse(window.localStorage.getItem("hometab.pinnedContainers.v1") || "[]") as string[];
+    } catch {
+      return [];
+    }
+  });
   const [pveActionMessage, setPveActionMessage] = useState("");
   const fnos = status.fnos || {
     available: true,
@@ -1714,8 +1790,19 @@ function SystemCards({
     accessUrls: []
   }));
   const containers = status.docker?.services || fallbackContainers;
+  const filteredContainers = containers
+    .filter((container) => {
+      const query = containerSearch.trim().toLowerCase();
+      const text = `${container.name} ${container.image} ${container.state}`.toLowerCase();
+      if (query && !text.includes(query)) return false;
+      if (containerStateFilter === "running" && container.state !== "running") return false;
+      if (containerStateFilter === "stopped" && container.state === "running") return false;
+      if (containerStateFilter === "updates" && !updateReports[container.id]?.hasUpdate) return false;
+      return true;
+    })
+    .sort((a, b) => Number(pinnedContainers.includes(b.id)) - Number(pinnedContainers.includes(a.id)) || a.name.localeCompare(b.name));
   const runningContainers = status.docker?.available ? status.docker.running : config.systems.containers.running;
-  const selectedContainer = containers.find((container) => container.id === selectedContainerId) || containers[0];
+  const selectedContainer = containers.find((container) => container.id === selectedContainerId) || filteredContainers[0] || containers[0];
   const selectedContainerKey = selectedContainer?.id || selectedContainer?.name || "";
   const selectedContainerHistory = selectedContainerKey ? history.containers[selectedContainerKey] : undefined;
   const fnosBookmark = config.bookmarks.find((bookmark) => bookmark.name === "飞牛OS");
@@ -1727,6 +1814,15 @@ function SystemCards({
 
   function selectContainer(container: DockerService) {
     if (container.id) setSelectedContainerId(container.id);
+  }
+
+  function togglePinnedContainer(container: DockerService) {
+    if (!container.id) return;
+    setPinnedContainers((current) => {
+      const next = current.includes(container.id) ? current.filter((id) => id !== container.id) : [container.id, ...current].slice(0, 12);
+      window.localStorage.setItem("hometab.pinnedContainers.v1", JSON.stringify(next));
+      return next;
+    });
   }
 
   async function showContainerLogs(container = selectedContainer) {
@@ -1781,9 +1877,10 @@ function SystemCards({
     }
   }
 
-  function requestContainerAction(action: "start" | "stop" | "restart", label: string, container = selectedContainer) {
+  async function requestContainerAction(action: "start" | "stop" | "restart", label: string, container = selectedContainer) {
     selectContainer(container);
     if (action === "stop" || action === "restart") {
+      await runUpdateAction("preview", container);
       setPendingContainerAction({ action, label, container });
       return;
     }
@@ -1806,7 +1903,9 @@ function SystemCards({
       });
       const text = await response.text();
       if (response.ok) {
-        const message = `已${label} ${container.name}，正在刷新状态。`;
+        const payload = text ? JSON.parse(text) as { undo?: { token: string; expiresAt: string } } : {};
+        if (payload.undo?.token) setUndoState({ token: payload.undo.token, label: `撤销${label}`, expiresAt: payload.undo.expiresAt });
+        const message = `已${label} ${container.name}，正在刷新状态。${payload.undo ? " 可在撤销窗口内恢复。" : ""}`;
         setActionMessage(message);
         onNotice(message);
         onAuditEvent(`Docker ${label}成功`, `${container.name} · 指令已执行`);
@@ -1846,10 +1945,27 @@ function SystemCards({
     }
   }
 
-  async function runUpdateAction(action: "update" | "pull" | "recreate" | "rollback", container = selectedContainer) {
+  async function undoLastOperation() {
+    if (!undoState || !onRequireAuth()) return;
+    setExecutingAction(`undo:${undoState.token}`);
+    try {
+      const response = await fetch(`/api/docker/undo/${encodeURIComponent(undoState.token)}`, { method: "POST", headers: authHeaders(authToken) });
+      if (!response.ok) throw new Error(await response.text());
+      setActionMessage("撤销操作已执行，正在刷新状态。");
+      setUndoState(null);
+      await onRefreshRuntime();
+    } catch (error) {
+      setActionMessage(error instanceof Error ? error.message : "撤销失败。");
+    } finally {
+      setExecutingAction("");
+    }
+  }
+
+  async function runUpdateAction(action: "preview" | "update" | "pull" | "recreate" | "rollback", container = selectedContainer) {
     if (!container?.id) return;
-    if (action !== "update" && !onRequireAuth()) return;
+    if (action !== "update" && action !== "preview" && !onRequireAuth()) return;
     const endpoints = {
+      preview: `/api/docker/containers/${encodeURIComponent(container.id)}/operation-preview`,
       update: `/api/docker/containers/${encodeURIComponent(container.id)}/update`,
       pull: `/api/docker/containers/${encodeURIComponent(container.id)}/pull`,
       recreate: `/api/docker/containers/${encodeURIComponent(container.id)}/recreate`,
@@ -1858,7 +1974,7 @@ function SystemCards({
     setExecutingAction(`update:${action}:${container.id}`);
     try {
       const response = await fetch(endpoints[action], {
-        method: action === "update" || action === "rollback" ? "GET" : "POST",
+        method: action === "update" || action === "rollback" || action === "preview" ? "GET" : "POST",
         headers: authHeaders(authToken)
       });
       const text = await response.text();
@@ -1867,8 +1983,16 @@ function SystemCards({
         throw new Error(text);
       }
       const payload = text ? JSON.parse(text) : {};
-      const message = action === "update"
-        ? `镜像 ${payload.image || container.image} 已检查，备份 ${payload.backups?.length || 0} 个。`
+      if (action === "update") {
+        setUpdateReports((current) => ({ ...current, [container.id]: payload as DockerUpdateReport }));
+      }
+      if (action === "preview") {
+        setUpdateReports((current) => ({ ...current, [container.id]: { ...(current[container.id] || {}), id: container.id, image: container.image, safety: payload } as DockerUpdateReport }));
+      }
+      const message = action === "preview"
+        ? `操作预览已生成：${payload.safe ? "可安全复原" : `存在风险 ${payload.risks?.join(", ") || "unknown"}`}。`
+        : action === "update"
+          ? `镜像 ${payload.image || container.image} 已检查：${payload.hasUpdate ? "发现更新" : "暂无更新"}，备份 ${payload.backups?.length || 0} 个。`
         : action === "pull"
           ? `已拉取 ${payload.image || container.image}。`
           : action === "recreate"
@@ -1881,6 +2005,45 @@ function SystemCards({
       const message = error instanceof Error ? error.message : "更新中心操作失败。";
       setUpdateMessage(message);
       onNotice(message);
+    } finally {
+      setExecutingAction("");
+    }
+  }
+
+  async function scanAllUpdates() {
+    setExecutingAction("updates:scan");
+    try {
+      const response = await fetch("/api/docker/updates");
+      if (!response.ok) throw new Error(await response.text());
+      const payload = await response.json() as { reports: DockerUpdateReport[] };
+      setUpdateReports(Object.fromEntries(payload.reports.map((report) => [report.id, report])));
+      setUpdateMessage(`已检查 ${payload.reports.length} 个容器，${payload.reports.filter((report) => report.hasUpdate).length} 个发现更新。`);
+    } catch (error) {
+      setUpdateMessage(error instanceof Error ? error.message : "批量检查失败。");
+    } finally {
+      setExecutingAction("");
+    }
+  }
+
+  async function bulkSafeUpdate() {
+    if (!onRequireAuth()) return;
+    const password = window.prompt("批量安全更新需要再次输入管理密码");
+    if (!password) return;
+    setExecutingAction("updates:bulk-safe");
+    try {
+      const response = await fetch("/api/docker/updates/bulk-safe", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...authHeaders(authToken) },
+        body: JSON.stringify({ password })
+      });
+      if (response.status === 401 || response.status === 403) onAuthExpired();
+      if (!response.ok) throw new Error(await response.text());
+      const payload = await response.json() as { updated: number };
+      setUpdateMessage(`已批量安全更新 ${payload.updated} 个容器。`);
+      await onRefreshRuntime();
+      await scanAllUpdates();
+    } catch (error) {
+      setUpdateMessage(error instanceof Error ? error.message : "批量安全更新失败。");
     } finally {
       setExecutingAction("");
     }
@@ -1970,7 +2133,23 @@ function SystemCards({
             <UiIcon name="bookmark" />
             {syncingWebBookmarks ? "同步中" : "同步Web书签到NAS"}
           </button>
+          <button type="button" disabled={Boolean(executingAction)} onClick={() => void scanAllUpdates()}>
+            <UiIcon name="search" />
+            检查全部更新
+          </button>
+          <button type="button" disabled={Boolean(executingAction)} onClick={() => void bulkSafeUpdate()}>
+            <UiIcon name="refresh" />
+            一键安全更新
+          </button>
           <span>{webContainerCount ? `发现 ${webContainerCount} 个带访问地址的容器` : "暂无可同步 Web 容器"}</span>
+        </div>
+        <div className="ops-filterbar">
+          <input value={containerSearch} onChange={(event) => setContainerSearch(event.target.value)} placeholder="搜索容器、镜像、状态" />
+          {(["all", "running", "stopped", "updates"] as const).map((item) => (
+            <button type="button" key={item} className={containerStateFilter === item ? "is-active" : ""} onClick={() => setContainerStateFilter(item)}>
+              {item === "all" ? "全部" : item === "running" ? "运行中" : item === "stopped" ? "已停止" : "有更新"}
+            </button>
+          ))}
         </div>
         <DockerOperationHistory events={dockerOperations} />
 
@@ -1983,9 +2162,10 @@ function SystemCards({
             <span>访问</span>
             <span>操作</span>
           </div>
-          {containers.map((service, index) => {
+          {filteredContainers.map((service, index) => {
             const isSelected = selectedContainer?.name === service.name;
             const firstUrl = service.accessUrls?.[0]?.url;
+            const report = updateReports[service.id];
             return (
               <div
                 className={isSelected ? "container-table__row container-table__row--active" : "container-table__row"}
@@ -1996,6 +2176,8 @@ function SystemCards({
                 <button className="container-name container-name-button" type="button" onClick={() => selectContainer(service)}>
                   {service.name || `container-${index + 1}`}
                   {service.health ? <small className={`health-chip health-chip--${service.health}`}>{healthText(service.health)}</small> : null}
+                  {report?.hasUpdate ? <small className="health-chip health-chip--update">有更新</small> : null}
+                  {pinnedContainers.includes(service.id) ? <small className="health-chip">置顶</small> : null}
                 </button>
                 <ResourceMeter className="resource-meter--cpu" value={readPercent(service.cpu)} label={service.cpu || "0%"} />
                 <ResourceMeter className="resource-meter--memory" value={readPercent(service.memory)} label={service.memory || "0%"} />
@@ -2012,6 +2194,9 @@ function SystemCards({
                   </button>
                   <button type="button" aria-label={`查看 ${service.name} 配置`} disabled={!service.id || Boolean(executingAction) || Boolean(configLoadingContainer)} onClick={() => showContainerConfig(service)}>
                     <UiIcon name="settings" />
+                  </button>
+                  <button type="button" aria-label={`置顶 ${service.name}`} disabled={!service.id} onClick={() => togglePinnedContainer(service)}>
+                    ↑
                   </button>
                 </span>
               </div>
@@ -2034,12 +2219,15 @@ function SystemCards({
             onRecreate={() => runUpdateAction("recreate", selectedContainer)}
             onRollbackList={() => runUpdateAction("rollback", selectedContainer)}
             updateMessage={updateMessage}
+            updateReport={updateReports[selectedContainer.id]}
+            undoState={undoState}
+            onUndo={() => void undoLastOperation()}
           />
         ) : null}
         {pendingContainerAction ? (
           <ConfirmDialog
             title={`${pendingContainerAction.label}容器`}
-            message={`确认要${pendingContainerAction.label} ${pendingContainerAction.container.name} 吗？这会直接作用于飞牛 OS 上的真实 Docker 容器。`}
+            message={`确认要${pendingContainerAction.label} ${pendingContainerAction.container.name} 吗？这会直接作用于真实 Docker 容器。${updateReports[pendingContainerAction.container.id]?.safety?.summary ? ` 镜像：${updateReports[pendingContainerAction.container.id]?.safety?.summary.image}；挂载：${updateReports[pendingContainerAction.container.id]?.safety?.summary.mounts?.length || 0}；端口：${Object.keys(updateReports[pendingContainerAction.container.id]?.safety?.summary.ports || {}).length}；环境变量：${updateReports[pendingContainerAction.container.id]?.safety?.summary.env?.length || 0}。` : ""}`}
             confirmLabel={pendingContainerAction.label}
             busy={Boolean(executingAction)}
             onCancel={() => setPendingContainerAction(null)}
@@ -2103,6 +2291,15 @@ function EventCenterPanel({ events, onClear }: { events: RuntimeEvent[]; onClear
 
 function EventCenterDialog({ events, onClear, onClose }: { events: RuntimeEvent[]; onClear: () => void; onClose: () => void }) {
   const [filter, setFilter] = useState<"all" | EventSeverity | "audit">("all");
+  const [auditFilter, setAuditFilter] = useState<"all" | "docker" | "pve" | "auth" | "notifications">("all");
+  const [auditEvents, setAuditEvents] = useState<AuditEvent[]>([]);
+  useEffect(() => {
+    const token = window.localStorage.getItem(authTokenKey) || "";
+    fetch("/api/audit", { headers: authHeaders(token) })
+      .then((response) => response.ok ? response.json() : Promise.reject(new Error("audit unavailable")))
+      .then((payload: { events?: AuditEvent[] }) => setAuditEvents(Array.isArray(payload.events) ? payload.events : []))
+      .catch(() => setAuditEvents([]));
+  }, []);
   const visibleEvents = filter === "all"
     ? events
     : filter === "audit"
@@ -2127,6 +2324,12 @@ function EventCenterDialog({ events, onClear, onClose }: { events: RuntimeEvent[
       downloadJson(`hometab-local-events-${new Date().toISOString().slice(0, 10)}.json`, events);
     }
   }
+  async function exportAuditCsv() {
+    const token = window.localStorage.getItem(authTokenKey) || "";
+    const response = await fetch("/api/audit/export.csv", { headers: authHeaders(token) });
+    if (response.ok) downloadText(`hometab-audit-${new Date().toISOString().slice(0, 10)}.csv`, await response.text());
+  }
+  const visibleAuditEvents = auditEvents.filter((event) => auditFilter === "all" || String(event.action || "").startsWith(auditFilter === "notifications" ? "notifications" : auditFilter));
 
   return (
     <DialogShell className="utility-dialog utility-dialog--wide events-dialog" onClose={onClose}>
@@ -2143,6 +2346,28 @@ function EventCenterDialog({ events, onClear, onClose }: { events: RuntimeEvent[
         <button className="events-clear" type="button" onClick={() => void exportAudit()}>
           导出审计
         </button>
+        <button className="events-clear" type="button" onClick={() => void exportAuditCsv()}>
+          导出 CSV
+        </button>
+      </div>
+      <div className="events-toolbar">
+        {(["all", "docker", "pve", "auth", "notifications"] as const).map((item) => (
+          <button className={auditFilter === item ? "events-filter events-filter--active" : "events-filter"} key={item} type="button" onClick={() => setAuditFilter(item)}>
+            {item === "all" ? "全部审计" : item === "docker" ? "Docker" : item === "pve" ? "PVE" : item === "auth" ? "登录" : "通知"}
+          </button>
+        ))}
+      </div>
+      <div className="audit-table">
+        {visibleAuditEvents.slice(0, 80).map((event) => (
+          <article key={event.id} className={`event-row event-row--${event.severity || "info"}`}>
+            <span>{event.result || "-"}</span>
+            <div>
+              <b>{event.action || "-"}</b>
+              <small>{event.target || "-"} · {event.detail || ""}{event.error ? ` · ${event.error}` : ""}</small>
+            </div>
+            <time>{event.at ? formatDateTime(event.at) : "-"}</time>
+          </article>
+        ))}
       </div>
       <div className="events-list">
         {groupedEvents.length ? groupedEvents.map((group) => (
@@ -2206,7 +2431,30 @@ function PveManagerPanel({
   onAction: (action: PveAction, label: string, vm: PveVm) => void;
 }) {
   const [detailVm, setDetailVm] = useState<PveVm | null>(null);
-  const visibleVms = vms.slice(0, 6);
+  const [query, setQuery] = useState("");
+  const [pinnedVms, setPinnedVms] = useState<string[]>(() => {
+    try {
+      return JSON.parse(window.localStorage.getItem("hometab.pinnedPve.v1") || "[]") as string[];
+    } catch {
+      return [];
+    }
+  });
+  const visibleVms = vms
+    .filter((vm) => {
+      const text = `${vm.name || ""} ${vm.vmid} ${vm.type} ${vm.status}`.toLowerCase();
+      return !query.trim() || text.includes(query.trim().toLowerCase());
+    })
+    .sort((a, b) => Number(pinnedVms.includes(`${b.type}:${b.vmid}`)) - Number(pinnedVms.includes(`${a.type}:${a.vmid}`)))
+    .slice(0, 8);
+
+  function togglePin(vm: PveVm) {
+    const key = `${vm.type}:${vm.vmid}`;
+    setPinnedVms((current) => {
+      const next = current.includes(key) ? current.filter((item) => item !== key) : [key, ...current].slice(0, 12);
+      window.localStorage.setItem("hometab.pinnedPve.v1", JSON.stringify(next));
+      return next;
+    });
+  }
 
   return (
     <section className="pve-manager" aria-label="PVE 实例管理">
@@ -2220,6 +2468,9 @@ function PveManagerPanel({
           {available ? `${node || "node"} 在线` : "未连接"}
         </span>
       </div>
+      <div className="ops-filterbar">
+        <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索 VM / LXC / VMID / 状态" />
+      </div>
       <div className="pve-vm-list">
         {visibleVms.length ? visibleVms.map((vm) => {
           const isRunning = vm.status === "running";
@@ -2231,7 +2482,7 @@ function PveManagerPanel({
               <span className={`run-state run-state--${isRunning ? "running" : "stopped"}`} />
               <div className="pve-vm-row__name">
                 <b>{vm.name || vm.vmid}</b>
-                <small>{vm.type.toUpperCase()} {vm.vmid} · {vm.status}</small>
+                <small>{vm.type.toUpperCase()} {vm.vmid} · {vm.status}{pinnedVms.includes(`${vm.type}:${vm.vmid}`) ? " · 置顶" : ""}</small>
               </div>
               <ResourceMeter value={cpu} label={`${cpu}%`} />
               <ResourceMeter value={memory} label={`${memory}%`} />
@@ -2241,6 +2492,7 @@ function PveManagerPanel({
                 <button type="button" disabled={busy || !isRunning} onClick={(event) => { event.stopPropagation(); onAction("shutdown", "关机", vm); }}>关机</button>
                 <button type="button" disabled={busy || !isRunning} onClick={(event) => { event.stopPropagation(); onAction("reboot", "重启", vm); }}>重启</button>
                 <button type="button" disabled={busy || !isRunning} onClick={(event) => { event.stopPropagation(); onAction("stop", "强停", vm); }}>强停</button>
+                <button type="button" onClick={(event) => { event.stopPropagation(); togglePin(vm); }}>置顶</button>
               </div>
             </article>
           );
@@ -2521,7 +2773,10 @@ function ContainerDetailPanel({
   onPullImage,
   onRecreate,
   onRollbackList,
-  updateMessage
+  updateMessage,
+  updateReport,
+  undoState,
+  onUndo
 }: {
   container: DockerService;
   actionMessage: string;
@@ -2536,6 +2791,9 @@ function ContainerDetailPanel({
   onRecreate: () => void;
   onRollbackList: () => void;
   updateMessage: string;
+  updateReport?: DockerUpdateReport;
+  undoState: { token: string; label: string; expiresAt: string } | null;
+  onUndo: () => void;
 }) {
   const cpu = readPercent(container.cpu);
   const memory = readPercent(container.memory);
@@ -2590,6 +2848,14 @@ function ContainerDetailPanel({
       </div>
       <div className="update-center">
         <b>更新中心</b>
+        {updateReport ? (
+          <div className="update-digest-grid">
+            <span><b>本地 digest</b><em>{updateReport.localDigest || "-"}</em></span>
+            <span><b>远端 digest</b><em>{updateReport.remoteDigest || "-"}</em></span>
+            <span><b>更新状态</b><em>{updateReport.hasUpdate ? "发现新镜像" : "暂无更新"}</em></span>
+            <span><b>重建安全</b><em>{updateReport.safety?.safe ? "可安全复原" : `风险：${updateReport.safety?.risks?.join(", ") || "-"}`}</em></span>
+          </div>
+        ) : null}
         <div className="panel-actions panel-actions--containers">
           <button type="button" disabled={isBusy} onClick={onUpdateCheck}><UiIcon name="search" />检查</button>
           <button type="button" disabled={isBusy} onClick={onPullImage}><UiIcon name="download" />拉取</button>
@@ -2598,6 +2864,12 @@ function ContainerDetailPanel({
         </div>
         {updateMessage ? <small>{updateMessage}</small> : <small>拉取、重建前会自动保存容器配置备份。</small>}
       </div>
+      {undoState ? (
+        <div className="undo-window">
+          <span>{undoState.label}窗口至 {formatDateTime(undoState.expiresAt)}</span>
+          <button type="button" disabled={isBusy} onClick={onUndo}>撤销</button>
+        </div>
+      ) : null}
       {actionMessage ? <p className="action-message">{actionMessage}</p> : null}
     </div>
   );
@@ -3001,6 +3273,10 @@ function SettingsDialog({
     telegramConfigured: false,
     webhookConfigured: false,
     wecomConfigured: false,
+    quietMinutes: 15,
+    dailySummaryEnabled: false,
+    dailySummaryHour: 9,
+    lastDailySummaryDate: "",
     barkUrl: "",
     serverChanKey: "",
     telegramBotToken: "",
@@ -3011,6 +3287,7 @@ function SettingsDialog({
   const [categoryDraft, setCategoryDraft] = useState<string[]>(config.categories);
   const [newCategory, setNewCategory] = useState("");
   const [message, setMessage] = useState("");
+  const [notificationTestResult, setNotificationTestResult] = useState("");
 
   useEffect(() => {
     if (open) {
@@ -3023,6 +3300,7 @@ function SettingsDialog({
       setCategoryDraft(config.categories);
       setNewCategory("");
       setMessage("");
+      setNotificationTestResult("");
     }
   }, [alertRules, config, connections, open]);
 
@@ -3197,7 +3475,8 @@ function SettingsDialog({
           throw new Error("登录已过期，请重新解锁。");
         }
         if (!testResponse.ok) throw new Error("测试通知发送失败。");
-        const result = await testResponse.json() as { ok?: boolean };
+        const result = await testResponse.json() as { ok?: boolean; results?: Array<{ channel: string; ok: boolean; status?: number; error?: string }>; skipped?: string };
+        setNotificationTestResult(result.results?.map((item) => `${item.channel}: ${item.ok ? "成功" : `失败 ${item.status || item.error || ""}`}`).join(" / ") || `跳过：${result.skipped || "无通道"}`);
         setMessage(result.ok ? "通知配置已保存，测试通知已发送。" : "通知配置已保存，但没有可用通道或通道未返回成功。");
         return;
       }
@@ -3286,6 +3565,37 @@ function SettingsDialog({
             />
             启用主动推送
           </label>
+          <label className="toggle-row">
+            <input
+              type="checkbox"
+              checked={notificationDraft.dailySummaryEnabled}
+              onChange={(event) => setNotificationDraft((current) => ({ ...current, dailySummaryEnabled: event.target.checked }))}
+            />
+            启用每日摘要
+          </label>
+          <div className="alert-rule-row">
+            <span>通知策略</span>
+            <label>
+              静默分钟
+              <input
+                type="number"
+                min={0}
+                max={1440}
+                value={notificationDraft.quietMinutes}
+                onChange={(event) => setNotificationDraft((current) => ({ ...current, quietMinutes: Number(event.target.value) }))}
+              />
+            </label>
+            <label>
+              摘要小时
+              <input
+                type="number"
+                min={0}
+                max={23}
+                value={notificationDraft.dailySummaryHour}
+                onChange={(event) => setNotificationDraft((current) => ({ ...current, dailySummaryHour: Number(event.target.value) }))}
+              />
+            </label>
+          </div>
           <div className="notification-status-grid">
             {[
               ["Bark", notificationDraft.barkConfigured],
@@ -3357,6 +3667,7 @@ function SettingsDialog({
               保存并测试
             </button>
           </div>
+          {notificationTestResult ? <p className="dialog-message">{notificationTestResult}</p> : null}
         </section>
         <section className="category-manager" aria-label="分类管理">
           <div className="alert-rules-panel__head">
@@ -3477,6 +3788,8 @@ function BackupDialog({
   const [pendingFile, setPendingFile] = useState<File | null>(null);
   const [preview, setPreview] = useState<(BackupSummary & { payload?: BackupPayload; source: "file" | "server" }) | null>(null);
   const [recentBackups, setRecentBackups] = useState<BackupSummary[]>([]);
+  const [backupSettings, setBackupSettings] = useState<BackupSettings>({ enabled: false, intervalHours: 24, keep: 14, note: "" });
+  const [backupDiff, setBackupDiff] = useState<Record<string, unknown> | null>(null);
   const [loadingBackups, setLoadingBackups] = useState(false);
 
   const loadRecentBackups = useCallback(async () => {
@@ -3498,7 +3811,9 @@ function BackupDialog({
       setMessage("");
       setPendingFile(null);
       setPreview(null);
+      setBackupDiff(null);
       void loadRecentBackups();
+      void fetch("/api/backups/settings").then((response) => response.ok ? response.json() : Promise.reject()).then(setBackupSettings).catch(() => undefined);
     }
   }, [loadRecentBackups, open]);
 
@@ -3526,7 +3841,34 @@ function BackupDialog({
     const payload = (await response.json()) as BackupPayload;
     setPendingFile(null);
     setPreview({ ...backup, payload, source: "server" });
+    setBackupDiff(null);
     setMessage("已读取历史备份，请确认后再恢复。");
+  }
+
+  async function saveBackupSettings() {
+    const response = await fetch("/api/backups/settings", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(backupSettings)
+    });
+    if (!response.ok) throw new Error("定时备份设置保存失败");
+    setBackupSettings(await response.json());
+    setMessage("定时备份设置已保存。");
+  }
+
+  async function compareBackup(backup: BackupSummary) {
+    const response = await fetch(`/api/backups/${encodeURIComponent(backup.name)}/compare`);
+    if (!response.ok) throw new Error("备份对比失败");
+    const payload = await response.json();
+    setBackupDiff(payload.diff || payload);
+    setMessage("已生成当前配置与该备份的差异。");
+  }
+
+  async function downloadBackupArchive() {
+    const response = await fetch("/api/backups/archive");
+    if (!response.ok) throw new Error("备份压缩包下载失败");
+    await downloadResponse(`hometab-backups-${new Date().toISOString().slice(0, 10)}.json.gz`, response);
+    setMessage("全部备份压缩包已下载。");
   }
 
   return (
@@ -3560,9 +3902,28 @@ function BackupDialog({
               }}
             />
           </label>
+          <button type="button" onClick={() => void downloadBackupArchive()}>
+            <UiIcon name="download" />
+            下载全部
+          </button>
         </div>
         <div className="backup-preview">
-          <b>最近 7 份</b>
+          <b>自动定时备份</b>
+          <label className="toggle-row">
+            <input type="checkbox" checked={backupSettings.enabled} onChange={(event) => setBackupSettings((current) => ({ ...current, enabled: event.target.checked }))} />
+            启用自动备份
+          </label>
+          <div className="alert-rule-row">
+            <span>备份策略</span>
+            <label>间隔小时<input type="number" min={1} max={168} value={backupSettings.intervalHours} onChange={(event) => setBackupSettings((current) => ({ ...current, intervalHours: Number(event.target.value) }))} /></label>
+            <label>保留份数<input type="number" min={3} max={60} value={backupSettings.keep} onChange={(event) => setBackupSettings((current) => ({ ...current, keep: Number(event.target.value) }))} /></label>
+          </div>
+          <input className="text-input" placeholder="备份备注" value={backupSettings.note || ""} onChange={(event) => setBackupSettings((current) => ({ ...current, note: event.target.value }))} />
+          <button type="button" onClick={() => void saveBackupSettings()}>保存定时策略</button>
+          <small>上次自动备份：{backupSettings.lastRunAt ? formatDateTime(backupSettings.lastRunAt) : "尚未执行"}</small>
+        </div>
+        <div className="backup-preview">
+          <b>最近备份</b>
           {loadingBackups ? <span>正在读取备份列表...</span> : null}
           {!loadingBackups && !recentBackups.length ? <span>还没有服务端备份，点击导出备份会自动保留一份。</span> : null}
           {recentBackups.map((backup) => (
@@ -3580,6 +3941,7 @@ function BackupDialog({
             >
               <span>{backup.exportedAt ? formatDateTime(backup.exportedAt) : backup.name}</span>
               <small>{backup.configBookmarks + backup.customBookmarks} 个书签 · {backup.categories} 个分类</small>
+              <small>{backup.version ? `v${backup.version}` : "v1"} · {backup.source || "manual"}{backup.note ? ` · ${backup.note}` : ""}</small>
             </button>
           ))}
         </div>
@@ -3590,6 +3952,11 @@ function BackupDialog({
             <span>默认书签：{preview.configBookmarks} 个</span>
             <span>自定义书签：{preview.customBookmarks} 个</span>
             <span>分类：{preview.categories} 个</span>
+            <span>版本：{preview.version || preview.payload?.version || "未知"}</span>
+            <span>来源：{preview.source === "server" ? preview.payload?.source || "manual" : preview.payload?.source || "file"}</span>
+            <button type="button" onClick={() => void compareBackup(preview)}>
+              对比当前配置
+            </button>
             <button type="button" onClick={async () => {
               if (preview.source === "file" && pendingFile) {
                 await onImport(pendingFile);
@@ -3603,6 +3970,15 @@ function BackupDialog({
             }}>
               {preview.source === "server" ? "确认恢复" : "确认导入"}
             </button>
+          </div>
+        ) : null}
+        {backupDiff ? (
+          <div className="backup-preview">
+            <b>备份差异</b>
+            <span>当前书签数：{String((backupDiff as { currentCount?: number }).currentCount ?? "-")}</span>
+            <span>备份书签数：{String((backupDiff as { backupCount?: number }).backupCount ?? "-")}</span>
+            <span>备份新增：{String(((backupDiff as { addedBookmarks?: string[] }).addedBookmarks || []).length)}</span>
+            <span>备份缺少：{String(((backupDiff as { removedBookmarks?: string[] }).removedBookmarks || []).length)}</span>
           </div>
         ) : null}
         {message ? <p className="dialog-message">{message}</p> : null}

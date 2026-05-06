@@ -1,0 +1,27 @@
+services:
+  hometab:
+    image: xiaoguiwucan0426/hometab-pilot:0.4.0
+    container_name: hometab-pilot
+    restart: unless-stopped
+    ports:
+      - "8088:8080"
+    environment:
+      PORT: 8080
+      DATA_DIR: /data
+      FNOS_URL: "http://fnos.example.local:5666"
+      FNOS_SSH_HOST: "fnos.example.local"
+      FNOS_SSH_PORT: 22
+      FNOS_SSH_USERNAME: "your-user"
+      FNOS_SSH_PASSWORD: ""
+      PVE_URL: "https://pve.example.local:8006"
+      PVE_USERNAME: "root@pam"
+      PVE_PASSWORD: ""
+      PVE_TLS_VERIFY: "false"
+      NOTIFY_ENABLED: "false"
+      NOTIFY_QUIET_MINUTES: 15
+      NOTIFY_DAILY_SUMMARY_HOUR: 9
+    volumes:
+      - hometab-data:/data
+
+volumes:
+  hometab-data:
